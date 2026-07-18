@@ -1,61 +1,37 @@
-# MCP Integration Guide — Swiggy Instamart
+# MCP Integration — Swiggy Instamart (authoritative)
 
-This document details how Recipe-to-Cart integrates with Swiggy's Instamart MCP server.
+Docs: https://mcp.swiggy.com/builders/docs/reference/instamart/
 
-## Overview
-
-We use three MCP endpoints in a sequential pipeline:
+## Real journey (MVP)
 
 ```
-searchProducts → checkAvailability → addItemsBulk
-                        ↓ (on failure)
-                  getSubstitutes → addItemsBulk (substitute)
+get_addresses → search_products → update_cart → get_cart
 ```
 
-## Catalog MCP
+Checkout / track_order intentionally omitted from this MVP.
 
-### `searchProducts(query, filters)`
+## Endpoint
 
-Called once per extracted ingredient. Claude pre-normalises the query before calling this:
+`POST https://mcp.swiggy.com/im` with `Authorization: Bearer <access_token>`
 
-- `"jeera"` → `"cumin seeds"` with filter `{ form: "seeds", NOT: "powder" }`
-- `"atta"` → `"wheat flour chapati"` with filter `{ type: "whole_wheat" }`
-- `"fresh coriander"` → `"coriander leaves fresh"` with filter `{ form: "fresh", NOT: "dried" }`
+JSON-RPC:
 
-### Response handling
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": { "name": "search_products", "arguments": { "addressId": "...", "query": "..." } },
+  "id": 1
+}
+```
 
-We pick the top result unless:
-- Price is >2× the second result (pick cheaper)
-- Pack size is >3× the required quantity (pick smaller)
-- Brand is blacklisted by user preferences
+## Auth
 
-## Inventory MCP
+OAuth 2.1 + PKCE via Dynamic Client Registration (`POST /auth/register`).
+See https://mcp.swiggy.com/builders/docs/start/authenticate.md
 
-### `checkAvailability(skuIds, pincode)`
+## Important
 
-Called in batch for all matched SKUs. Response includes `eta_minutes` — we surface this in the UI ("Arrives in 15 min").
-
-### `getSubstitutes(skuId, strategy)`
-
-Three strategies exposed in UI:
-- `closest_match` — Claude ranks by flavour/function similarity (default)
-- `cheapest` — price-optimised substitute
-- `same_brand` — user prefers a specific brand
-
-## Cart MCP
-
-### `addItemsBulk(items)`
-
-Single call for all ingredients. Partial success is handled — if 2 of 11 items fail, the other 9 are still added and failures are shown in the UI with retry options.
-
-## Rate Limiting
-
-Expected call pattern per user session:
-- `searchProducts`: 8–15 calls (one per ingredient)
-- `checkAvailability`: 1 batch call
-- `addItemsBulk`: 1 call
-- `getSubstitutes`: 0–3 calls (only on stock failures)
-
-**Total per session: ~15–20 MCP calls**
-
-At 1K daily active sessions: ~15K–20K MCP calls/day.
+- Cart lines use `spinId` (variant), not a generic skuId
+- `update_cart` **replaces** the entire cart
+- Always resolve `addressId` from `get_addresses` before search

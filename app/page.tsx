@@ -1,0 +1,470 @@
+"use client";
+
+import { useEffect, useState } from "react";
+
+type Me = {
+  isLoggedIn: boolean;
+  addressId: string | null;
+  addressLabel: string | null;
+};
+
+type Address = {
+  id: string;
+  label?: string;
+  address?: string;
+  addressLine?: string;
+  locality?: string;
+  city?: string;
+};
+
+type MatchRow = {
+  ingredient: {
+    original: string;
+    name: string;
+    searchQuery: string;
+    quantity: number | null;
+    unit: string | null;
+  };
+  status: "matched" | "unmatched";
+  product?: { name: string; brand?: string };
+  variant?: { spinId: string; label: string; price?: number };
+  quantityInfo?: {
+    requiredLabel: string;
+    addedLabel: string;
+    coverageNote: string;
+    packsNeeded: number;
+    packLabel?: string;
+  };
+  suggestedPacks?: number;
+  error?: string;
+  selected?: boolean;
+  packs?: number;
+};
+
+export default function HomePage() {
+  const [me, setMe] = useState<Me | null>(null);
+  const [addresses, setAddresses] = useState<Address[]>([]);
+  const [addressId, setAddressId] = useState<string>("");
+  const [addressLoadError, setAddressLoadError] = useState<string | null>(null);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [filling, setFilling] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [title, setTitle] = useState<string | undefined>();
+  const [note, setNote] = useState<string | undefined>();
+  const [servingsMeta, setServingsMeta] = useState<string | null>(null);
+  const [llmStatus, setLlmStatus] = useState<string | null>(null);
+  const [matches, setMatches] = useState<MatchRow[]>([]);
+  const [cartPreview, setCartPreview] = useState<unknown>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const ae = params.get("authError");
+    if (ae) setAuthError(ae);
+
+    refreshMe();
+    fetch("/api/llm/status")
+      .then((r) => r.json())
+      .then((d) => setLlmStatus(d.ready ? d.detail : d.detail))
+      .catch(() => setLlmStatus(null));
+  }, []);
+
+  async function refreshMe() {
+    setAddressLoadError(null);
+    const res = await fetch("/api/me");
+    const data = await res.json();
+    setMe(data);
+    if (data.addressId) setAddressId(data.addressId);
+    if (data.isLoggedIn) {
+      const a = await fetch("/api/addresses");
+      const json = await a.json().catch(() => ({}));
+      if (!a.ok) {
+        if (json.code === "UNAUTHENTICATED") {
+          setMe({ ...data, isLoggedIn: false });
+          setAddressLoadError("Session expired — sign in with Swiggy again.");
+          return;
+        }
+        setAddressLoadError(json.error || `Address load failed (${a.status})`);
+        setAddresses([]);
+        return;
+      }
+      setAddresses(json.addresses || []);
+      if ((json.addresses || []).length === 0) {
+        setAddressLoadError(
+          "Swiggy returned 0 addresses. Confirm this account has saved addresses in the Swiggy app, then click Refresh addresses."
+        );
+      }
+    }
+  }
+
+  async function selectAddress(id: string) {
+    setAddressId(id);
+    const addr = addresses.find((a) => a.id === id);
+    const label =
+      addr?.label ||
+      [addr?.addressLine || addr?.address, addr?.locality, addr?.city]
+        .filter(Boolean)
+        .join(", ");
+    await fetch("/api/addresses/select", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ addressId: id, addressLabel: label }),
+    });
+  }
+
+  async function runMatch() {
+    setError(null);
+    setCartPreview(null);
+    setLoading(true);
+    try {
+      const res = await fetch("/api/match", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ input, addressId: addressId || undefined }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (data.code === "UNAUTHENTICATED") {
+          window.location.href = "/auth/login";
+          return;
+        }
+        throw new Error(data.error || "Match failed");
+      }
+      setTitle(data.title);
+      setNote(data.note);
+      setServingsMeta(
+        data.servings
+          ? `${data.servings} ${data.appetite || "medium"} servings` +
+              (data.provider ? ` · via ${data.provider}` : "")
+          : null
+      );
+      setMatches(
+        (data.matches || []).map(
+          (m: MatchRow & { quantity?: MatchRow["quantityInfo"]; suggestedPacks?: number }) => {
+            const quantityInfo = m.quantityInfo || m.quantity;
+            return {
+              ...m,
+              quantityInfo,
+              selected: m.status === "matched",
+              packs: m.suggestedPacks || quantityInfo?.packsNeeded || 1,
+            };
+          }
+        )
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Something went wrong");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function fillCart() {
+    const items = matches
+      .filter((m) => m.selected && m.variant?.spinId)
+      .map((m) => ({
+        spinId: m.variant!.spinId,
+        quantity: m.packs || 1,
+      }));
+
+    if (!items.length) {
+      setError("Select at least one matched item.");
+      return;
+    }
+
+    setFilling(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/cart", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          items,
+          addressId: addressId || undefined,
+          replace: true,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (data.code === "UNAUTHENTICATED") {
+          window.location.href = "/auth/login";
+          return;
+        }
+        throw new Error(data.error || "Could not fill cart");
+      }
+      setCartPreview(data.cart);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Cart fill failed");
+    } finally {
+      setFilling(false);
+    }
+  }
+
+  const matchedSelected = matches.filter((m) => m.selected).length;
+
+  return (
+    <main className="mx-auto max-w-3xl px-5 pb-24 pt-10">
+      <header className="animate-rise mb-10">
+        <p className="mb-3 text-sm font-semibold tracking-[0.18em] text-[var(--orange)] uppercase">
+          Instamart · Recipe-to-Cart
+        </p>
+        <h1 className="font-display text-4xl leading-tight font-semibold tracking-tight text-[var(--ink)] sm:text-5xl">
+          From recipe to a filled cart
+        </h1>
+        <p className="mt-4 max-w-xl text-base leading-relaxed text-[var(--muted)]">
+          Paste a URL or ingredient list. We match Instamart products via Swiggy
+          MCP and fill your cart — checkout stays in your hands for this MVP.
+        </p>
+      </header>
+
+      <section className="animate-rise-delay space-y-6">
+        {!me?.isLoggedIn ? (
+          <div className="rounded-2xl border border-black/5 bg-white/70 p-6 backdrop-blur">
+            <h2 className="font-display text-xl font-semibold">
+              Connect Swiggy
+            </h2>
+            <p className="mt-2 text-sm text-[var(--muted)]">
+              Sign in with Swiggy (phone + OTP). We use OAuth 2.1 + PKCE — no
+              passwords stored here.
+            </p>
+            {authError && (
+              <p className="mt-3 text-sm text-red-700">Auth error: {authError}</p>
+            )}
+            <a
+              href="/auth/login"
+              className="mt-5 inline-flex items-center justify-center rounded-full bg-[var(--orange)] px-6 py-3 text-sm font-semibold text-white transition hover:brightness-105"
+            >
+              Continue with Swiggy
+            </a>
+          </div>
+        ) : (
+          <>
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-black/5 bg-white/70 px-5 py-4 backdrop-blur">
+              <div>
+                <p className="text-sm font-medium text-[var(--leaf)]">
+                  Connected to Swiggy
+                </p>
+                <p className="text-xs text-[var(--muted)]">
+                  Session uses Instamart MCP tools on your account
+                </p>
+              </div>
+              <a
+                href="/auth/logout"
+                className="text-sm font-medium text-[var(--muted)] underline-offset-2 hover:underline"
+              >
+                Sign out
+              </a>
+            </div>
+
+            <div className="rounded-2xl border border-black/5 bg-white/70 p-5 backdrop-blur">
+              <label className="text-sm font-semibold">Delivery address</label>
+              <p className="mt-1 text-xs text-[var(--muted)]">
+                Required for product search at your location
+              </p>
+              {addressLoadError && (
+                <p className="mt-3 text-sm text-amber-800">{addressLoadError}</p>
+              )}
+              {addresses.length === 0 ? (
+                <div className="mt-3 space-y-2">
+                  <p className="text-sm text-[var(--muted)]">
+                    No saved addresses loaded yet.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={refreshMe}
+                    className="text-sm font-semibold text-[var(--orange)] underline-offset-2 hover:underline"
+                  >
+                    Refresh addresses
+                  </button>
+                </div>
+              ) : (
+                <select
+                  className="mt-3 w-full rounded-xl border border-black/10 bg-white px-3 py-3 text-sm outline-none focus:border-[var(--orange)]"
+                  value={addressId}
+                  onChange={(e) => selectAddress(e.target.value)}
+                >
+                  <option value="">Select address…</option>
+                  {addresses.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {(a.label ? `${a.label} · ` : "") +
+                        [a.addressLine || a.address, a.locality, a.city]
+                          .filter(Boolean)
+                          .join(", ")}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+
+            <div className="rounded-2xl border border-black/5 bg-white/70 p-5 backdrop-blur">
+              <label className="text-sm font-semibold">Recipe input</label>
+              <p className="mt-1 text-xs text-[var(--muted)]">
+                Dish name with servings, URL, or ingredient list
+              </p>
+              {llmStatus && (
+                <p className="mt-2 text-xs text-[var(--muted)]">LLM: {llmStatus}</p>
+              )}
+              <textarea
+                className="mt-3 min-h-[140px] w-full rounded-xl border border-black/10 bg-white px-3 py-3 text-sm outline-none focus:border-[var(--orange)]"
+                placeholder={`Examples:\nchilli chicken for 10 medium eaters\n\nhttps://hebbarskitchen.com/...\n\n2 cups besan\n1 tsp jeera`}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+              />
+              <button
+                type="button"
+                disabled={loading || !input.trim() || !addressId}
+                onClick={runMatch}
+                className="mt-4 inline-flex items-center justify-center rounded-full bg-[var(--ink)] px-6 py-3 text-sm font-semibold text-white transition enabled:hover:bg-black disabled:opacity-40"
+              >
+                {loading ? (
+                  <span className="animate-pulse-soft">
+                    Expanding recipe & matching Instamart…
+                  </span>
+                ) : (
+                  "Parse & match"
+                )}
+              </button>
+            </div>
+          </>
+        )}
+
+        {error && (
+          <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
+            {error}
+          </p>
+        )}
+
+        {matches.length > 0 && (
+          <section className="space-y-4">
+            <div>
+              <h2 className="font-display text-2xl font-semibold">
+                {title || "Matched ingredients"}
+              </h2>
+              {servingsMeta && (
+                <p className="mt-1 text-sm font-medium text-[var(--leaf)]">
+                  {servingsMeta}
+                </p>
+              )}
+              {note && (
+                <p className="mt-1 text-sm text-[var(--muted)]">{note}</p>
+              )}
+              <p className="mt-1 text-sm text-[var(--muted)]">
+                {matchedSelected} selected · review required vs added before
+                filling cart
+              </p>
+            </div>
+
+            <ul className="space-y-3">
+              {matches.map((m, idx) => (
+                <li
+                  key={`${m.ingredient.searchQuery}-${idx}`}
+                  className="rounded-2xl border border-black/5 bg-white/80 p-4"
+                >
+                  <div className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      className="mt-1"
+                      checked={Boolean(m.selected)}
+                      disabled={m.status !== "matched"}
+                      onChange={(e) => {
+                        const next = [...matches];
+                        next[idx] = { ...m, selected: e.target.checked };
+                        setMatches(next);
+                      }}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium">
+                        {m.ingredient.original}
+                      </p>
+                      {m.quantityInfo && (
+                        <div className="mt-2 grid gap-1 text-xs sm:grid-cols-2">
+                          <p className="rounded-lg bg-black/5 px-2 py-1.5">
+                            <span className="font-semibold text-[var(--ink)]">
+                              Required:{" "}
+                            </span>
+                            {m.quantityInfo.requiredLabel}
+                          </p>
+                          <p className="rounded-lg bg-[var(--orange)]/10 px-2 py-1.5">
+                            <span className="font-semibold text-[var(--ink)]">
+                              Added:{" "}
+                            </span>
+                            {m.packs || m.quantityInfo.packsNeeded} ×{" "}
+                            {m.variant?.label || m.quantityInfo.packLabel || "pack"}
+                          </p>
+                        </div>
+                      )}
+                      {m.quantityInfo?.coverageNote && (
+                        <p className="mt-1 text-xs text-[var(--muted)]">
+                          {m.quantityInfo.coverageNote}
+                        </p>
+                      )}
+                      {m.status === "matched" && m.product && m.variant ? (
+                        <p className="mt-2 text-sm text-[var(--muted)]">
+                          → {m.product.name}
+                          {m.product.brand ? ` · ${m.product.brand}` : ""}
+                          {typeof m.variant.price === "number"
+                            ? ` · ₹${m.variant.price}/pack`
+                            : ""}
+                        </p>
+                      ) : (
+                        <p className="mt-1 text-sm text-amber-800">
+                          Unmatched{m.error ? `: ${m.error}` : ""}
+                        </p>
+                      )}
+                    </div>
+                    {m.status === "matched" && (
+                      <div className="text-right">
+                        <label className="block text-[10px] uppercase tracking-wide text-[var(--muted)]">
+                          Packs
+                        </label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={20}
+                          value={m.packs || 1}
+                          onChange={(e) => {
+                            const next = [...matches];
+                            next[idx] = {
+                              ...m,
+                              packs: Number(e.target.value) || 1,
+                            };
+                            setMatches(next);
+                          }}
+                          className="w-16 rounded-lg border border-black/10 px-2 py-1 text-sm"
+                        />
+                      </div>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+
+            <button
+              type="button"
+              disabled={filling || matchedSelected === 0}
+              onClick={fillCart}
+              className="inline-flex items-center justify-center rounded-full bg-[var(--orange)] px-6 py-3 text-sm font-semibold text-white transition enabled:hover:brightness-105 disabled:opacity-40"
+            >
+              {filling ? "Filling Instamart cart…" : "Fill Instamart cart"}
+            </button>
+          </section>
+        )}
+
+        {cartPreview != null && (
+          <section className="rounded-2xl border border-[var(--leaf)]/30 bg-[var(--leaf)]/10 p-5">
+            <h2 className="font-display text-xl font-semibold text-[var(--leaf)]">
+              Cart updated
+            </h2>
+            <p className="mt-2 text-sm text-[var(--muted)]">
+              Your Instamart cart was replaced with the selected recipe items.
+              Open the Swiggy app to review totals and checkout when ready.
+            </p>
+            <pre className="mt-4 max-h-64 overflow-auto rounded-xl bg-black/5 p-3 text-xs">
+              {JSON.stringify(cartPreview, null, 2)}
+            </pre>
+          </section>
+        )}
+      </section>
+    </main>
+  );
+}

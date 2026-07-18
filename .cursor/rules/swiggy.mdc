@@ -1,0 +1,13 @@
+---
+description: Swiggy Builders Club docs
+alwaysApply: true
+---
+
+Authoritative Swiggy MCP docs:
+- https://mcp.swiggy.com/builders/llms.txt (index)
+- https://mcp.swiggy.com/builders/llms-full.txt (full)
+- Append `.md` to any https://mcp.swiggy.com/builders/docs/... URL
+
+Reference these before writing Swiggy MCP code. The tool catalog is at
+/docs/reference/{food,instamart,dineout}. Never invent tool names,
+parameters, or error codes — look them up.
