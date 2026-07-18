@@ -32,12 +32,11 @@ User pastes recipe URL  →  Claude parses ingredients  →  Instamart cart fill
 | Field | Details |
 |---|---|
 | **Team / Project** | Recipe-to-Cart · Solo Developer |
-| **GitHub** | `github.com/yourusername/recipe-to-cart` |
-| **LinkedIn** | `linkedin.com/in/yourprofile` |
+| **GitHub** | `github.com/Siri-09-tech/instamart-recipe-to-cart` |
+| **LinkedIn** | `linkedin.com/in/siri-boddula-nitw/` |
 | **MCP Servers** | Swiggy Instamart |
 | **Integration Type** | AI Agent / Copilot + Web App |
 | **Expected Volume** | 1K–10K / day |
-| **Redirect URI** | `https://recipe-to-cart.app/auth/callback` |
 
 ---
 
