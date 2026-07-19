@@ -1,4 +1,4 @@
-import { callInstamartTool } from "./client";
+﻿import { callInstamartTool, withInstamartSession } from "./client";
 
 export type SwiggyAddress = {
   id: string;
@@ -38,6 +38,8 @@ export type CartItemInput = {
   spinId: string;
   skuId?: string;
   quantity: number;
+  /** Optional display name â€” used to re-search for a fresh spin before cart write */
+  name?: string;
 };
 
 export type CartData = {
@@ -209,7 +211,7 @@ function asProductList(data: unknown): Product[] {
           : typeof val === "string" && val.trim()
             ? Number(val)
             : NaN;
-      // Pack counts are small; 250/500 are pack sizes in g/ml — ignore those
+      // Pack counts are small; 250/500 are pack sizes in g/ml â€” ignore those
       if (Number.isFinite(n) && n >= 0 && n <= 30) return Math.floor(n);
     }
     return undefined;
@@ -394,19 +396,129 @@ export async function searchProducts(
   return products;
 }
 
-/** Replaces the entire Instamart cart with the provided items. */
+
+function clampQty(n: number): number {
+  return Math.max(1, Math.min(20, Math.floor(n) || 1));
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function isCartStockError(err: unknown): boolean {
+  return /out of stock|ITEM_OUT_OF_STOCK|partially available|all items .* unavailable|CART_EXPIRED/i.test(
+    errMsg(err)
+  );
+}
+
+function cartAddressId(cart: CartData | null | undefined): string {
+  if (!cart || typeof cart !== "object") return "";
+  const c = cart as Record<string, unknown>;
+  for (const key of [
+    "selectedAddress",
+    "selectedAddressId",
+    "addressId",
+    "address_id",
+  ]) {
+    const val = c[key];
+    if (val != null && typeof val !== "object" && String(val).trim()) {
+      return String(val).trim();
+    }
+    if (val && typeof val === "object" && "id" in (val as object)) {
+      const id = (val as Record<string, unknown>).id;
+      if (id != null && String(id).trim()) return String(id).trim();
+    }
+  }
+  const details = c.selectedAddressDetails;
+  if (details && typeof details === "object") {
+    const id = (details as Record<string, unknown>).id;
+    if (id != null && String(id).trim()) return String(id).trim();
+  }
+  return "";
+}
+
+function cartHasOosItems(cart: CartData | null | undefined): boolean {
+  const items = Array.isArray(cart?.items) ? cart!.items! : [];
+  return items.some(
+    (it) =>
+      it &&
+      typeof it === "object" &&
+      (it as Record<string, unknown>).isInStockAndAvailable === false
+  );
+}
+
+type CartLineIds = {
+  spinId: string;
+  skuId: string;
+  quantity: number;
+  name?: string;
+};
+
+/** MCP requires both spinId and skuId on every update_cart line. */
+function toCartLine(
+  spinId: string,
+  skuId: string,
+  quantity: number,
+  name?: string
+): CartLineIds | null {
+  const s = String(spinId || "").trim();
+  const k = String(skuId || "").trim();
+  if (!s || !k) return null;
+  return { spinId: s, skuId: k, quantity: clampQty(quantity), name };
+}
+
+function collectCandidatesFromProducts(
+  products: Product[],
+  quantity: number,
+  preferred?: { spinId?: string; skuId?: string }
+): CartLineIds[] {
+  const out: CartLineIds[] = [];
+  const seen = new Set<string>();
+
+  const push = (spinId: string, skuId: string, name?: string) => {
+    const line = toCartLine(spinId, skuId, quantity, name);
+    if (!line) return;
+    const key = `${line.spinId}::${line.skuId}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(line);
+  };
+
+  if (preferred?.spinId && preferred?.skuId) {
+    push(preferred.spinId, preferred.skuId);
+  }
+
+  for (const p of products) {
+    const name = String(p.displayName || p.name || "");
+    for (const v of p.variants || []) {
+      if (v.spinId && v.skuId) {
+        push(v.spinId, v.skuId, name);
+        // Some payloads invert the two fields
+        push(v.skuId, v.spinId, name);
+      }
+    }
+  }
+
+  return out;
+}
+
+/** Low-level update_cart. Prefer replaceCart() for app flows. */
 export async function updateCart(
   token: string,
   selectedAddressId: string,
   items: CartItemInput[]
 ): Promise<unknown> {
   const normalized = items.map((item) => {
-    const row: Record<string, unknown> = {
+    if (!item.skuId) {
+      throw new Error(
+        `Missing skuId for spinId=${item.spinId}. Both spinId and skuId are required.`
+      );
+    }
+    return {
       spinId: item.spinId,
-      quantity: item.quantity,
+      skuId: item.skuId,
+      quantity: clampQty(item.quantity),
     };
-    if (item.skuId) row.skuId = item.skuId;
-    return row;
   });
   return callInstamartTool(token, "update_cart", {
     selectedAddressId,
@@ -421,4 +533,231 @@ export async function getCart(token: string): Promise<CartData> {
 
 export async function clearCart(token: string): Promise<unknown> {
   return callInstamartTool(token, "clear_cart", {});
+}
+
+/**
+ * Safely read cart. Stock/partial errors on get_cart mean a ghost cart —
+ * clear once and treat as empty so fill can proceed.
+ */
+export async function getCartSafe(token: string): Promise<{
+  cart: CartData;
+  clearedStale: boolean;
+}> {
+  try {
+    return { cart: await getCart(token), clearedStale: false };
+  } catch (err) {
+    if (!isCartStockError(err)) throw err;
+    console.log("[get_cart] stock/partial error — clearing:", errMsg(err));
+    await clearCart(token).catch((e) =>
+      console.log("[get_cart] clear failed:", errMsg(e))
+    );
+    try {
+      return { cart: await getCart(token), clearedStale: true };
+    } catch (retryErr) {
+      console.log(
+        "[get_cart] still failing after clear; empty fallback:",
+        errMsg(retryErr)
+      );
+      return { cart: { items: [] }, clearedStale: true };
+    }
+  }
+}
+
+async function updateCartLines(
+  call: <T>(name: string, args?: Record<string, unknown>) => Promise<T>,
+  selectedAddressId: string,
+  lines: CartLineIds[],
+  label: string
+): Promise<unknown> {
+  const payload = lines.map((l) => ({
+    spinId: l.spinId,
+    skuId: l.skuId,
+    quantity: l.quantity,
+  }));
+  console.log(
+    `[replace_cart] try=${label} items=${JSON.stringify(payload)}`
+  );
+  const result = await call<unknown>("update_cart", {
+    selectedAddressId,
+    items: payload,
+  });
+  console.log(`[replace_cart] SUCCESS via ${label}`);
+  return result;
+}
+
+/**
+ * Replace Instamart cart in one MCP session.
+ *
+ * Live MCP contract: every item needs BOTH spinId and skuId.
+ * Search can still return spins that fail as OOS on update_cart — walk
+ * the next search candidates (and spin/sku swapped) until one sticks.
+ */
+export async function replaceCart(
+  token: string,
+  selectedAddressId: string,
+  items: CartItemInput[]
+): Promise<unknown> {
+  if (!items.length) throw new Error("No items to add to cart.");
+
+  return withInstamartSession(token, async (call) => {
+    let cart: CartData = { items: [] };
+    try {
+      cart = (await call<CartData>("get_cart", {})) ?? {};
+    } catch (err) {
+      console.log("[replace_cart] get_cart:", errMsg(err));
+      if (isCartStockError(err)) {
+        await call("clear_cart", {}).catch((e) =>
+          console.log("[replace_cart] clear after get error:", errMsg(e))
+        );
+      }
+    }
+
+    const existing = Array.isArray(cart.items) ? cart.items : [];
+    if (existing.length > 0 || cartHasOosItems(cart)) {
+      console.log(
+        `[replace_cart] clearing before write (lines=${existing.length} addr=${cartAddressId(cart) || "none"})`
+      );
+      await call("clear_cart", {}).catch((e) =>
+        console.log("[replace_cart] clear failed:", errMsg(e))
+      );
+    }
+
+    const candidateLists: CartLineIds[][] = [];
+    for (const item of items) {
+      const qty = clampQty(item.quantity);
+      let products: Product[] = [];
+      const q = (item.name || "").trim();
+      if (q) {
+        try {
+          const raw = await call<unknown>("search_products", {
+            addressId: selectedAddressId,
+            query: q,
+            offset: 0,
+          });
+          products = asProductList(raw);
+        } catch (e) {
+          console.log(
+            `[replace_cart] fresh search failed for "${q}":`,
+            errMsg(e)
+          );
+        }
+      }
+
+      const candidates = collectCandidatesFromProducts(products, qty, {
+        spinId: item.spinId,
+        skuId: item.skuId,
+      });
+
+      if (item.spinId && item.skuId) {
+        const primary = toCartLine(item.spinId, item.skuId, qty, item.name);
+        if (primary) {
+          const key = `${primary.spinId}::${primary.skuId}`;
+          if (!candidates.some((c) => `${c.spinId}::${c.skuId}` === key)) {
+            candidates.unshift(primary);
+          }
+        }
+      }
+
+      if (!candidates.length) {
+        throw new Error(
+          `No spinId+skuId pair for "${item.name || item.spinId}". Re-run Parse & match.`
+        );
+      }
+
+      console.log(
+        `[replace_cart] candidates for "${item.name || item.spinId}":`,
+        candidates
+          .slice(0, 8)
+          .map((c) => `${c.spinId}/${c.skuId}`)
+          .join(", ")
+      );
+      candidateLists.push(candidates);
+    }
+
+    const primary = candidateLists.map((list) => list[0]);
+    try {
+      return await updateCartLines(
+        call,
+        selectedAddressId,
+        primary,
+        "primary spinId+skuId"
+      );
+    } catch (err) {
+      console.log("[replace_cart] primary failed:", errMsg(err));
+      if (!isCartStockError(err) && !/skuId|spinId/i.test(errMsg(err))) {
+        throw err;
+      }
+    }
+
+    // Single item: walk search candidates until one adds
+    if (items.length === 1) {
+      const list = candidateLists[0];
+      let lastError: unknown;
+      for (let i = 0; i < Math.min(list.length, 8); i++) {
+        const line = list[i];
+        try {
+          await call("clear_cart", {}).catch(() => {});
+          return await updateCartLines(
+            call,
+            selectedAddressId,
+            [line],
+            `candidate[${i}] ${line.name || line.spinId}`
+          );
+        } catch (err) {
+          lastError = err;
+          console.log(`[replace_cart] candidate[${i}] failed:`, errMsg(err));
+        }
+      }
+      throw lastError instanceof Error
+        ? lastError
+        : new Error(
+            errMsg(lastError) ||
+              "Could not add any in-stock variant at this address"
+          );
+    }
+
+    // Multi-item: build cart one line at a time with substitutes
+    const accepted: CartLineIds[] = [];
+    const failures: string[] = [];
+
+    for (let i = 0; i < candidateLists.length; i++) {
+      const list = candidateLists[i];
+      let added = false;
+      for (let j = 0; j < Math.min(list.length, 6); j++) {
+        const trial = [...accepted, list[j]];
+        try {
+          await call("clear_cart", {}).catch(() => {});
+          await updateCartLines(
+            call,
+            selectedAddressId,
+            trial,
+            `build item[${i}] cand[${j}]`
+          );
+          accepted.push(list[j]);
+          added = true;
+          break;
+        } catch (err) {
+          console.log(
+            `[replace_cart] build item[${i}] cand[${j}] failed:`,
+            errMsg(err)
+          );
+        }
+      }
+      if (!added) failures.push(items[i].name || items[i].spinId);
+    }
+
+    if (!accepted.length) {
+      throw new Error(
+        `Could not add items (out of stock at this address): ${failures.join(", ")}`
+      );
+    }
+
+    await call("clear_cart", {}).catch(() => {});
+    return updateCartLines(
+      call,
+      selectedAddressId,
+      accepted,
+      `final ${accepted.length}/${items.length} items`
+    );
+  });
 }

@@ -228,10 +228,10 @@ export default function HomePage() {
 
   function selectedCartItems(): CartItemPayload[] {
     return matches
-      .filter((m) => m.selected && m.variant?.spinId)
+      .filter((m) => m.selected && m.variant?.spinId && m.variant?.skuId)
       .map((m) => ({
         spinId: m.variant!.spinId,
-        ...(m.variant!.skuId ? { skuId: m.variant!.skuId } : {}),
+        skuId: m.variant!.skuId!,
         quantity: m.packs || 1,
         name: m.product?.name || m.ingredient.original,
       }));
@@ -245,7 +245,14 @@ export default function HomePage() {
         window.location.href = "/auth/login";
         return null;
       }
-      throw new Error(data.error || "Could not read Instamart cart");
+      const msg = String(data.error || "");
+      // Stale Instamart cart (OOS / partial) — treat as empty so fill can proceed
+      if (
+        /out of stock|partially available|CART_EXPIRED|unavailable/i.test(msg)
+      ) {
+        return { items: [] };
+      }
+      throw new Error(msg || "Could not read Instamart cart");
     }
     return (data.cart || null) as CartSnapshot | null;
   }
@@ -254,7 +261,9 @@ export default function HomePage() {
   async function prepareFillCart() {
     const items = selectedCartItems();
     if (!items.length) {
-      setError("Select at least one matched item.");
+      setError(
+        "Select at least one matched item that has both spinId and skuId (re-run Parse & match if needed)."
+      );
       return;
     }
 
@@ -262,7 +271,14 @@ export default function HomePage() {
     setOverwritePrompt(null);
     setFilling(true);
     try {
-      const cart = await fetchCurrentCart();
+      let cart: CartSnapshot | null = null;
+      try {
+        cart = await fetchCurrentCart();
+      } catch (e) {
+        // Don't block fill on a broken cart read — replaceCart will clear/rebuild
+        console.warn("cart pre-check failed, filling anyway", e);
+        cart = { items: [] };
+      }
       const existing = asCartItems(cart);
       if (existing.length > 0) {
         setOverwritePrompt({ existing, pending: items });

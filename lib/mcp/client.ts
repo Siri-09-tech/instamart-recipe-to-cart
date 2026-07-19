@@ -40,10 +40,18 @@ export class McpToolError extends Error {
   }
 }
 
-export async function callInstamartTool<T>(
-  accessToken: string,
+type ToolCaller = <T>(
   name: string,
-  args: Record<string, unknown> = {}
+  args?: Record<string, unknown>
+) => Promise<T>;
+
+/**
+ * Run multiple Instamart tool calls on one MCP connection.
+ * Cart mutations are more reliable when get/clear/update share a session.
+ */
+export async function withInstamartSession<T>(
+  accessToken: string,
+  fn: (call: ToolCaller) => Promise<T>
 ): Promise<T> {
   const client = new Client({ name: "recipe-to-cart", version: "0.1.0" });
   const transport = new StreamableHTTPClientTransport(new URL(IM_URL), {
@@ -54,8 +62,7 @@ export async function callInstamartTool<T>(
     },
   });
 
-  try {
-    await client.connect(transport);
+  const call: ToolCaller = async (name, args = {}) => {
     const result = await client.callTool({ name, arguments: args });
     const payload = result as {
       isError?: boolean;
@@ -71,8 +78,12 @@ export async function callInstamartTool<T>(
       throw new McpToolError(msg);
     }
 
-    const parsed = parseToolPayload<T>(payload);
-    return parsed;
+    return parseToolPayload(payload);
+  };
+
+  try {
+    await client.connect(transport);
+    return await fn(call);
   } catch (err) {
     if (err instanceof McpAuthError || err instanceof McpToolError) throw err;
     const message = err instanceof Error ? err.message : String(err);
@@ -87,6 +98,14 @@ export async function callInstamartTool<T>(
       // ignore close errors
     }
   }
+}
+
+export async function callInstamartTool<T>(
+  accessToken: string,
+  name: string,
+  args: Record<string, unknown> = {}
+): Promise<T> {
+  return withInstamartSession(accessToken, (call) => call<T>(name, args));
 }
 
 function extractText(result: {

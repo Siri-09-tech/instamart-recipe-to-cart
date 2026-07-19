@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { jsonError, requireAccessToken, getSession } from "@/lib/api/helpers";
-import { updateCart, getCart } from "@/lib/mcp/instamart";
+import { replaceCart, getCart, getCartSafe } from "@/lib/mcp/instamart";
 import { diffCartAvailability } from "@/lib/match/availability";
 
 const fillSchema = z.object({
@@ -31,10 +31,18 @@ export async function POST(req: Request) {
       );
     }
 
-    // update_cart already replaces the entire cart — do NOT clear first.
-    // clear_cart → update_cart often yields "all items out of stock" from Instamart.
-    const updateResult = await updateCart(token, addressId, body.items);
-    let cart = await getCart(token);
+    const updateResult = await replaceCart(
+      token,
+      addressId,
+      body.items.map((i) => ({
+        spinId: i.spinId,
+        ...(i.skuId ? { skuId: i.skuId } : {}),
+        quantity: i.quantity,
+        ...(i.name ? { name: i.name } : {}),
+      }))
+    );
+
+    let cart = await getCart(token).catch(() => null);
     if (!cart || (Array.isArray(cart.items) && cart.items.length === 0)) {
       const fromUpdate =
         updateResult && typeof updateResult === "object"
@@ -49,8 +57,8 @@ export async function POST(req: Request) {
       }
     }
 
-    const cartItems = Array.isArray(cart.items)
-      ? (cart.items as Array<Record<string, unknown>>)
+    const cartItems = Array.isArray(cart?.items)
+      ? (cart!.items as Array<Record<string, unknown>>)
       : [];
 
     const availabilityIssues = diffCartAvailability(
@@ -83,8 +91,8 @@ export async function POST(req: Request) {
 export async function GET() {
   try {
     const { token } = await requireAccessToken();
-    const cart = await getCart(token);
-    return Response.json({ cart });
+    const { cart, clearedStale } = await getCartSafe(token);
+    return Response.json({ cart, clearedStale });
   } catch (err) {
     return jsonError(err, "Failed to load cart");
   }
