@@ -13,6 +13,7 @@ const bodySchema = z.object({
         quantity: z.number().nullable(),
         unit: z.string().nullable(),
         searchQuery: z.string(),
+        aliases: z.array(z.string()).optional().default([]),
         avoid: z.array(z.string()).default([]),
       })
     )
@@ -63,7 +64,15 @@ export async function POST(req: Request) {
     const matches = await matchIngredientsToProducts(
       token,
       addressId,
-      ingredients
+      ingredients,
+      {
+        mode:
+          source === "grocery"
+            ? "grocery"
+            : source === "llm" || source === "dish"
+              ? "recipe"
+              : source || "match",
+      }
     );
 
     // Persist selected address if passed

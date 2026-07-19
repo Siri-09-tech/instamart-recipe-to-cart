@@ -1,9 +1,9 @@
 /**
- * Free / local LLM chat completions for recipe extraction.
- * Priority: Ollama (local) → Groq (free key) → Gemini (free key)
+ * LLM chat completions for recipe extraction.
+ * Priority: NVIDIA NIM → Ollama (local) → Groq → Gemini
  */
 
-export type LlmProviderName = "ollama" | "groq" | "gemini";
+export type LlmProviderName = "nvidia" | "ollama" | "groq" | "gemini";
 
 export type LlmChatResult = {
   provider: LlmProviderName;
@@ -15,6 +15,14 @@ const OLLAMA_BASE = process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434";
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "llama3.2";
 const GROQ_MODEL = process.env.GROQ_MODEL || "llama-3.3-70b-versatile";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+
+const NVIDIA_API_KEY =
+  process.env.NVIDIA_API_KEY || process.env.NIM_API_KEY || "";
+const NVIDIA_BASE =
+  process.env.NVIDIA_NIM_BASE_URL || "https://integrate.api.nvidia.com/v1";
+// Prefer a smaller/faster instruct model; 70B often cold-starts past client timeouts
+const NVIDIA_MODEL =
+  process.env.NVIDIA_NIM_MODEL || "meta/llama-3.1-8b-instruct";
 
 export async function isOllamaAvailable(): Promise<boolean> {
   try {
@@ -31,8 +39,17 @@ export async function detectLlmProvider(): Promise<{
   provider: LlmProviderName | null;
   detail: string;
 }> {
+  if (NVIDIA_API_KEY) {
+    return {
+      provider: "nvidia",
+      detail: `NVIDIA NIM (${NVIDIA_MODEL})`,
+    };
+  }
   if (await isOllamaAvailable()) {
-    return { provider: "ollama", detail: `Ollama @ ${OLLAMA_BASE} (${OLLAMA_MODEL})` };
+    return {
+      provider: "ollama",
+      detail: `Ollama @ ${OLLAMA_BASE} (${OLLAMA_MODEL})`,
+    };
   }
   if (process.env.GROQ_API_KEY) {
     return { provider: "groq", detail: `Groq (${GROQ_MODEL})` };
@@ -43,7 +60,7 @@ export async function detectLlmProvider(): Promise<{
   return {
     provider: null,
     detail:
-      "No LLM configured. Install Ollama (ollama.com) and run `ollama pull llama3.2`, or set GROQ_API_KEY / GEMINI_API_KEY in .env.local",
+      "No LLM configured. Set NVIDIA_API_KEY (build.nvidia.com), or install Ollama and `ollama pull llama3.2`, or set GROQ_API_KEY / GEMINI_API_KEY in .env.local",
   };
 }
 
@@ -57,6 +74,9 @@ export async function chatJson(opts: {
     throw new Error(detected.detail);
   }
 
+  if (detected.provider === "nvidia") {
+    return chatNvidia(opts);
+  }
   if (detected.provider === "ollama") {
     return chatOllama(opts);
   }
@@ -64,6 +84,55 @@ export async function chatJson(opts: {
     return chatGroq(opts);
   }
   return chatGemini(opts);
+}
+
+async function chatNvidia(opts: {
+  system: string;
+  user: string;
+  temperature?: number;
+}): Promise<LlmChatResult> {
+  let res: Response;
+  try {
+    res = await fetch(`${NVIDIA_BASE}/chat/completions`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${NVIDIA_API_KEY}`,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        model: NVIDIA_MODEL,
+        temperature: opts.temperature ?? 0.2,
+        max_tokens: 2048,
+        stream: false,
+        messages: [
+          { role: "system", content: opts.system },
+          { role: "user", content: opts.user },
+        ],
+      }),
+      signal: AbortSignal.timeout(180_000),
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/aborted|timeout|TimeoutError/i.test(msg)) {
+      throw new Error(
+        `NVIDIA NIM timed out waiting for ${NVIDIA_MODEL}. Try a faster model in .env.local (e.g. NVIDIA_NIM_MODEL=meta/llama-3.1-8b-instruct) or check build.nvidia.com status.`
+      );
+    }
+    throw err;
+  }
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`NVIDIA NIM error (${res.status}): ${text.slice(0, 300)}`);
+  }
+
+  const json = (await res.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const text = json.choices?.[0]?.message?.content?.trim();
+  if (!text) throw new Error("NVIDIA NIM returned an empty response");
+  return { provider: "nvidia", model: NVIDIA_MODEL, text };
 }
 
 async function chatOllama(opts: {
@@ -84,7 +153,7 @@ async function chatOllama(opts: {
         { role: "user", content: opts.user },
       ],
     }),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(240_000),
   });
 
   if (!res.ok) {

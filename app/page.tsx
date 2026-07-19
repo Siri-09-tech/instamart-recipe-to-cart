@@ -27,7 +27,7 @@ type MatchRow = {
   };
   status: "matched" | "unmatched";
   product?: { name: string; brand?: string };
-  variant?: { spinId: string; label: string; price?: number };
+  variant?: { spinId: string; skuId?: string; label: string; price?: number };
   quantityInfo?: {
     requiredLabel: string;
     addedLabel: string;
@@ -39,7 +39,60 @@ type MatchRow = {
   error?: string;
   selected?: boolean;
   packs?: number;
+  availability?: {
+    status: "available" | "partial" | "unavailable" | "unknown";
+    requestedQty: number;
+    availableQty: number | null;
+    note: string;
+  };
 };
+
+type AvailabilityIssue = {
+  name: string;
+  spinId?: string;
+  status: "unavailable" | "partial" | "missing";
+  requestedQty: number;
+  availableQty: number;
+  note: string;
+};
+
+type CartLine = {
+  spinId?: string;
+  skuId?: string;
+  itemName?: string;
+  name?: string;
+  quantity?: number;
+  discountedFinalPrice?: number;
+  mrp?: number;
+};
+
+type CartSnapshot = {
+  cartTotalAmount?: string;
+  items?: CartLine[];
+  billBreakdown?: {
+    toPay?: { label?: string; value?: string };
+  };
+  cartId?: string;
+  [key: string]: unknown;
+};
+
+type CartItemPayload = {
+  spinId: string;
+  skuId?: string;
+  quantity: number;
+  name?: string;
+};
+
+function asCartItems(cart: unknown): CartLine[] {
+  if (!cart || typeof cart !== "object") return [];
+  const obj = cart as CartSnapshot;
+  if (Array.isArray(obj.items)) return obj.items;
+  return [];
+}
+
+function cartItemLabel(item: CartLine): string {
+  return String(item.itemName || item.name || item.spinId || "Item");
+}
 
 export default function HomePage() {
   const [me, setMe] = useState<Me | null>(null);
@@ -55,8 +108,15 @@ export default function HomePage() {
   const [servingsMeta, setServingsMeta] = useState<string | null>(null);
   const [llmStatus, setLlmStatus] = useState<string | null>(null);
   const [matches, setMatches] = useState<MatchRow[]>([]);
-  const [cartPreview, setCartPreview] = useState<unknown>(null);
+  const [cartPreview, setCartPreview] = useState<CartSnapshot | null>(null);
+  const [availabilityIssues, setAvailabilityIssues] = useState<
+    AvailabilityIssue[]
+  >([]);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [overwritePrompt, setOverwritePrompt] = useState<{
+    existing: CartLine[];
+    pending: CartItemPayload[];
+  } | null>(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -116,6 +176,8 @@ export default function HomePage() {
   async function runMatch() {
     setError(null);
     setCartPreview(null);
+    setOverwritePrompt(null);
+    setAvailabilityIssues([]);
     setLoading(true);
     try {
       const res = await fetch("/api/match", {
@@ -141,7 +203,12 @@ export default function HomePage() {
       );
       setMatches(
         (data.matches || []).map(
-          (m: MatchRow & { quantity?: MatchRow["quantityInfo"]; suggestedPacks?: number }) => {
+          (
+            m: MatchRow & {
+              quantity?: MatchRow["quantityInfo"];
+              suggestedPacks?: number;
+            }
+          ) => {
             const quantityInfo = m.quantityInfo || m.quantity;
             return {
               ...m,
@@ -159,21 +226,60 @@ export default function HomePage() {
     }
   }
 
-  async function fillCart() {
-    const items = matches
+  function selectedCartItems(): CartItemPayload[] {
+    return matches
       .filter((m) => m.selected && m.variant?.spinId)
       .map((m) => ({
         spinId: m.variant!.spinId,
+        ...(m.variant!.skuId ? { skuId: m.variant!.skuId } : {}),
         quantity: m.packs || 1,
+        name: m.product?.name || m.ingredient.original,
       }));
+  }
 
+  async function fetchCurrentCart(): Promise<CartSnapshot | null> {
+    const res = await fetch("/api/cart");
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (data.code === "UNAUTHENTICATED") {
+        window.location.href = "/auth/login";
+        return null;
+      }
+      throw new Error(data.error || "Could not read Instamart cart");
+    }
+    return (data.cart || null) as CartSnapshot | null;
+  }
+
+  /** Check existing cart; prompt overwrite only when non-empty. */
+  async function prepareFillCart() {
+    const items = selectedCartItems();
     if (!items.length) {
       setError("Select at least one matched item.");
       return;
     }
 
+    setError(null);
+    setOverwritePrompt(null);
+    setFilling(true);
+    try {
+      const cart = await fetchCurrentCart();
+      const existing = asCartItems(cart);
+      if (existing.length > 0) {
+        setOverwritePrompt({ existing, pending: items });
+        return;
+      }
+      await commitFillCart(items, true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Cart check failed");
+    } finally {
+      setFilling(false);
+    }
+  }
+
+  async function commitFillCart(items: CartItemPayload[], replace: boolean) {
     setFilling(true);
     setError(null);
+    setOverwritePrompt(null);
     try {
       const res = await fetch("/api/cart", {
         method: "POST",
@@ -181,7 +287,7 @@ export default function HomePage() {
         body: JSON.stringify({
           items,
           addressId: addressId || undefined,
-          replace: true,
+          replace,
         }),
       });
       const data = await res.json();
@@ -192,7 +298,12 @@ export default function HomePage() {
         }
         throw new Error(data.error || "Could not fill cart");
       }
-      setCartPreview(data.cart);
+      // Prefer fresh get_cart payload; fall back to update response
+      const fresh = await fetchCurrentCart().catch(() => null);
+      setCartPreview((fresh || data.cart || null) as CartSnapshot | null);
+      setAvailabilityIssues(
+        Array.isArray(data.availabilityIssues) ? data.availabilityIssues : []
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Cart fill failed");
     } finally {
@@ -201,6 +312,12 @@ export default function HomePage() {
   }
 
   const matchedSelected = matches.filter((m) => m.selected).length;
+  const previewItems = asCartItems(cartPreview);
+  const stockProblems = matches.filter(
+    (m) =>
+      m.availability?.status === "partial" ||
+      m.availability?.status === "unavailable"
+  );
 
   return (
     <main className="mx-auto max-w-3xl px-5 pb-24 pt-10">
@@ -302,7 +419,9 @@ export default function HomePage() {
                 Dish name with servings, URL, or ingredient list
               </p>
               {llmStatus && (
-                <p className="mt-2 text-xs text-[var(--muted)]">LLM: {llmStatus}</p>
+                <p className="mt-2 text-xs text-[var(--muted)]">
+                  LLM: {llmStatus}
+                </p>
               )}
               <textarea
                 className="mt-3 min-h-[140px] w-full rounded-xl border border-black/10 bg-white px-3 py-3 text-sm outline-none focus:border-[var(--orange)]"
@@ -389,7 +508,9 @@ export default function HomePage() {
                               Added:{" "}
                             </span>
                             {m.packs || m.quantityInfo.packsNeeded} ×{" "}
-                            {m.variant?.label || m.quantityInfo.packLabel || "pack"}
+                            {m.variant?.label ||
+                              m.quantityInfo.packLabel ||
+                              "pack"}
                           </p>
                         </div>
                       )}
@@ -411,6 +532,26 @@ export default function HomePage() {
                           Unmatched{m.error ? `: ${m.error}` : ""}
                         </p>
                       )}
+                      {m.availability &&
+                        m.availability.note &&
+                        (m.availability.status === "partial" ||
+                          m.availability.status === "unavailable") && (
+                          <p
+                            className={`mt-2 text-xs font-medium ${
+                              m.availability.status === "unavailable"
+                                ? "text-red-700"
+                                : "text-amber-800"
+                            }`}
+                          >
+                            {m.availability.status === "unavailable"
+                              ? "Unavailable"
+                              : "Partially available"}
+                            : {m.availability.note}
+                            {m.availability.availableQty != null
+                              ? ` (available qty: ${m.availability.availableQty})`
+                              : ""}
+                          </p>
+                        )}
                     </div>
                     {m.status === "matched" && (
                       <div className="text-right">
@@ -439,29 +580,160 @@ export default function HomePage() {
               ))}
             </ul>
 
+            {stockProblems.length > 0 && (
+              <div className="rounded-2xl border border-amber-300 bg-amber-50 p-4">
+                <h3 className="text-sm font-semibold text-amber-950">
+                  Availability issues ({stockProblems.length})
+                </h3>
+                <ul className="mt-2 space-y-2 text-sm text-amber-950">
+                  {stockProblems.map((m, i) => (
+                    <li key={`stock-${i}`}>
+                      <span className="font-medium">
+                        {m.product?.name || m.ingredient.original}
+                      </span>
+                      {" — "}
+                      {m.availability?.status === "unavailable" ||
+                      m.status === "unmatched"
+                        ? "Unavailable"
+                        : "Partially available"}
+                      {m.availability?.availableQty != null
+                        ? ` · available qty: ${m.availability.availableQty}`
+                        : ""}
+                      {m.availability?.requestedQty
+                        ? ` · wanted: ${m.availability.requestedQty}`
+                        : ""}
+                      {m.availability?.note ? (
+                        <span className="block text-xs text-amber-900/80">
+                          {m.availability.note}
+                        </span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
             <button
               type="button"
               disabled={filling || matchedSelected === 0}
-              onClick={fillCart}
+              onClick={prepareFillCart}
               className="inline-flex items-center justify-center rounded-full bg-[var(--orange)] px-6 py-3 text-sm font-semibold text-white transition enabled:hover:brightness-105 disabled:opacity-40"
             >
-              {filling ? "Filling Instamart cart…" : "Fill Instamart cart"}
+              {filling ? "Checking Instamart cart…" : "Fill Instamart cart"}
             </button>
+          </section>
+        )}
+
+        {overwritePrompt && (
+          <section className="rounded-2xl border border-amber-300 bg-amber-50 p-5">
+            <h2 className="font-display text-xl font-semibold text-amber-950">
+              Cart already has {overwritePrompt.existing.length} item
+              {overwritePrompt.existing.length === 1 ? "" : "s"}
+            </h2>
+            <p className="mt-2 text-sm text-amber-900/80">
+              Overwriting replaces everything currently in your Instamart cart
+              with the {overwritePrompt.pending.length} selected recipe items.
+            </p>
+            <ul className="mt-3 max-h-40 space-y-1 overflow-auto text-sm text-amber-950">
+              {overwritePrompt.existing.slice(0, 12).map((item, i) => (
+                <li key={`${item.spinId || i}`}>
+                  · {cartItemLabel(item)}
+                  {item.quantity ? ` × ${item.quantity}` : ""}
+                </li>
+              ))}
+              {overwritePrompt.existing.length > 12 && (
+                <li className="text-amber-800">
+                  …and {overwritePrompt.existing.length - 12} more
+                </li>
+              )}
+            </ul>
+            <div className="mt-4 flex flex-wrap gap-3">
+              <button
+                type="button"
+                disabled={filling}
+                onClick={() =>
+                  commitFillCart(overwritePrompt.pending, true)
+                }
+                className="inline-flex items-center justify-center rounded-full bg-[var(--ink)] px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-40"
+              >
+                {filling ? "Overwriting…" : "Overwrite cart"}
+              </button>
+              <button
+                type="button"
+                disabled={filling}
+                onClick={() => setOverwritePrompt(null)}
+                className="inline-flex items-center justify-center rounded-full border border-black/15 bg-white px-5 py-2.5 text-sm font-semibold text-[var(--ink)] disabled:opacity-40"
+              >
+                Cancel
+              </button>
+            </div>
           </section>
         )}
 
         {cartPreview != null && (
           <section className="rounded-2xl border border-[var(--leaf)]/30 bg-[var(--leaf)]/10 p-5">
             <h2 className="font-display text-xl font-semibold text-[var(--leaf)]">
-              Cart updated
+              Cart updated on Instamart
             </h2>
             <p className="mt-2 text-sm text-[var(--muted)]">
-              Your Instamart cart was replaced with the selected recipe items.
-              Open the Swiggy app to review totals and checkout when ready.
+              {previewItems.length} item
+              {previewItems.length === 1 ? "" : "s"}
+              {cartPreview.cartTotalAmount
+                ? ` · ${cartPreview.cartTotalAmount}`
+                : cartPreview.billBreakdown?.toPay?.value
+                  ? ` · ${cartPreview.billBreakdown.toPay.value}`
+                  : ""}
+              . Open the Swiggy Instamart app and refresh the cart to checkout.
             </p>
-            <pre className="mt-4 max-h-64 overflow-auto rounded-xl bg-black/5 p-3 text-xs">
-              {JSON.stringify(cartPreview, null, 2)}
-            </pre>
+            {previewItems.length > 0 ? (
+              <ul className="mt-4 space-y-2">
+                {previewItems.map((item, i) => (
+                  <li
+                    key={`${item.spinId || i}`}
+                    className="rounded-xl bg-white/70 px-3 py-2 text-sm"
+                  >
+                    <span className="font-medium">{cartItemLabel(item)}</span>
+                    <span className="text-[var(--muted)]">
+                      {" "}
+                      × {item.quantity ?? 1}
+                      {typeof item.discountedFinalPrice === "number"
+                        ? ` · ₹${item.discountedFinalPrice}`
+                        : ""}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p className="mt-3 text-sm text-amber-800">
+                Instamart returned an updated cart payload, but no line items
+                were parsed. Check the Swiggy app cart directly.
+              </p>
+            )}
+
+            {availabilityIssues.length > 0 && (
+              <div className="mt-4 rounded-xl border border-amber-300 bg-amber-50 p-3">
+                <p className="text-sm font-semibold text-amber-950">
+                  Not fully added ({availabilityIssues.length})
+                </p>
+                <ul className="mt-2 space-y-1.5 text-sm text-amber-950">
+                  {availabilityIssues.map((issue, i) => (
+                    <li key={`issue-${issue.spinId || i}`}>
+                      <span className="font-medium">{issue.name}</span>
+                      {" — "}
+                      {issue.status === "partial"
+                        ? "Partially available"
+                        : issue.status === "missing"
+                          ? "Missing from cart"
+                          : "Unavailable"}
+                      {` · available qty: ${issue.availableQty} · wanted: ${issue.requestedQty}`}
+                      <span className="block text-xs text-amber-900/80">
+                        {issue.note}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
           </section>
         )}
       </section>

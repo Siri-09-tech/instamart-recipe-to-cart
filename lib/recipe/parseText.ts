@@ -6,6 +6,7 @@ export type ParsedIngredient = {
   quantity: number | null;
   unit: string | null;
   searchQuery: string;
+  aliases: string[];
   avoid: string[];
 };
 
@@ -21,6 +22,8 @@ const UNIT_ALIASES: Record<string, string> = {
   cup: "cup",
   cups: "cup",
   g: "g",
+  gm: "g",
+  gms: "g",
   gram: "g",
   grams: "g",
   kg: "kg",
@@ -39,10 +42,14 @@ const UNIT_ALIASES: Record<string, string> = {
   bunches: "bunch",
   packet: "packet",
   pack: "packet",
+  tub: "packet",
 };
 
 const LINE_RE =
-  /^(?:[-*•\d.)]+\s*)?(?:(\d+(?:[./]\d+)?)\s*(?:-|to\s+\d+(?:[./]\d+)?)?\s*)?([a-zA-Z]+)?\s+(.+)$/i;
+  /^(?:[-*•]\s+)?(?:(\d+(?:[./]\d+)?)\s*(?:-|to\s+\d+(?:[./]\d+)?)?\s*)?([a-zA-Z]+)?\s+(.+)$/i;
+
+const TRAILING_QTY_RE =
+  /^(.*?)[\s,:-]+(\d+(?:\.\d+)?)\s*(gm|gms|grams?|kg|g|ml|mls|l|lt|litre|liter|cup|cups|tsp|tbsp|pc|pcs|tub|pack|packet)s?\s*$/i;
 
 function parseFraction(raw: string): number {
   if (raw.includes("/")) {
@@ -59,8 +66,11 @@ export function parseIngredientLine(line: string): ParsedIngredient | null {
     .trim();
   if (!trimmed || trimmed.length < 2) return null;
 
-  // Skip section headers
-  if (/^(ingredients|method|instructions|directions|for the|to serve)/i.test(trimmed)) {
+  if (
+    /^(ingredients|method|instructions|directions|for the|to serve)/i.test(
+      trimmed
+    )
+  ) {
     return null;
   }
 
@@ -84,9 +94,19 @@ export function parseIngredientLine(line: string): ParsedIngredient | null {
     }
   }
 
-  // Strip leading "of "
+  // Trailing size: "butterscotch ice cream tub 500ml"
+  if (quantity == null) {
+    const trail = trimmed.match(TRAILING_QTY_RE);
+    if (trail) {
+      rest = trail[1].trim();
+      quantity = Number(trail[2]);
+      unit = UNIT_ALIASES[trail[3].toLowerCase()] || trail[3].toLowerCase();
+    }
+  }
+
   rest = rest.replace(/^of\s+/i, "").trim();
-  // Drop trailing prep notes after comma sometimes
+  // Drop marketing words that hurt search
+  rest = rest.replace(/\b(tub|pack|packet|bottle|carton)\b/gi, " ").replace(/\s+/g, " ").trim();
   const namePart = rest.split(",")[0].trim();
   if (!namePart) return null;
 
@@ -95,9 +115,10 @@ export function parseIngredientLine(line: string): ParsedIngredient | null {
   return {
     original: trimmed,
     name: norm.name || namePart,
-    quantity,
+    quantity: Number.isFinite(quantity as number) ? quantity : null,
     unit,
     searchQuery: norm.query,
+    aliases: norm.searchQueries.filter((q) => q !== norm.query),
     avoid: norm.avoid,
   };
 }

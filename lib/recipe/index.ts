@@ -3,10 +3,11 @@ import { fetchRecipeFromUrl } from "./fetchUrl";
 import { COMMON_DISHES } from "./commonDishes";
 import { expandDishWithLlm } from "./expandDish";
 import { detectLlmProvider } from "@/lib/llm/provider";
+import { classifyInputIntent } from "./intent";
 
 export type RecipeParseResult = {
   title?: string;
-  source: "url" | "text" | "dish" | "llm";
+  source: "url" | "text" | "dish" | "llm" | "grocery";
   ingredients: ParsedIngredient[];
   note?: string;
   servings?: number;
@@ -15,50 +16,17 @@ export type RecipeParseResult = {
   model?: string;
 };
 
-function looksLikeUrl(input: string): boolean {
-  return /^https?:\/\//i.test(input.trim());
-}
-
-/** Multi-line or comma-separated ingredient list (not a dish phrase). */
-function looksLikeIngredientList(input: string): boolean {
-  const trimmed = input.trim();
-  if (trimmed.includes("\n")) return true;
-  // "2 cups besan, 1 tsp jeera" style
-  if (
-    /,/.test(trimmed) &&
-    /\d/.test(trimmed) &&
-    /(cup|tsp|tbsp|g|kg|ml|onion|tomato|salt|oil|dal|flour)/i.test(trimmed)
-  ) {
-    return true;
-  }
-  return false;
-}
-
-/** Phrases like "chilli chicken for 10 medium eaters" */
-function looksLikeDishRequest(input: string): boolean {
-  const t = input.trim().toLowerCase();
-  if (looksLikeUrl(t) || looksLikeIngredientList(t)) return false;
-  if (/\bfor\s+\d+|\bserves?\s+\d+|\b\d+\s+(people|persons|guests|eaters|pax)\b/i.test(t)) {
-    return true;
-  }
-  // Short single-line food name without unit patterns
-  if (!trimmedHasUnitPattern(t) && t.split(/\s+/).length <= 12) {
-    return true;
-  }
-  return false;
-}
-
-function trimmedHasUnitPattern(t: string): boolean {
-  return /^\d+(\.\d+)?\s*(cup|cups|tsp|tbsp|g|kg|ml|l)\b/i.test(t);
-}
-
-export async function parseRecipeInput(input: string): Promise<RecipeParseResult> {
+export async function parseRecipeInput(
+  input: string
+): Promise<RecipeParseResult> {
   const trimmed = input.trim();
   if (!trimmed) {
     throw new Error("Paste a recipe URL, ingredient list, or dish name.");
   }
 
-  if (looksLikeUrl(trimmed)) {
+  const intent = classifyInputIntent(trimmed);
+
+  if (intent === "url") {
     const fetched = await fetchRecipeFromUrl(trimmed);
     return {
       title: fetched.title,
@@ -67,12 +35,22 @@ export async function parseRecipeInput(input: string): Promise<RecipeParseResult
     };
   }
 
-  if (looksLikeIngredientList(trimmed)) {
+  if (intent === "grocery" || intent === "ingredient_list") {
     const ingredients = parseIngredientText(trimmed);
     if (ingredients.length === 0) {
       throw new Error("Could not parse any ingredients from that text.");
     }
-    return { source: "text", ingredients };
+    const isSingle = ingredients.length === 1 && intent === "grocery";
+    return {
+      title: isSingle
+        ? ingredients[0].name || ingredients[0].searchQuery
+        : undefined,
+      source: isSingle ? "grocery" : "text",
+      ingredients,
+      note: isSingle
+        ? "Treated as a grocery item (not a full recipe)."
+        : undefined,
+    };
   }
 
   // Built-in exact dish templates (fast path, no LLM)
@@ -91,41 +69,24 @@ export async function parseRecipeInput(input: string): Promise<RecipeParseResult
     };
   }
 
-  if (looksLikeDishRequest(trimmed)) {
-    const llm = await expandDishWithLlm(trimmed);
-    return {
-      title: llm.title,
-      source: "llm",
-      servings: llm.servings,
-      appetite: llm.appetite,
-      ingredients: llm.ingredients,
-      provider: llm.provider,
-      model: llm.model,
-      note:
-        llm.notes ||
-        `Scaled for ${llm.servings} ${llm.appetite} eaters via ${llm.provider} (${llm.model}).`,
-    };
-  }
-
-  // Last resort: try LLM anyway, then built-ins message
   const detected = await detectLlmProvider();
-  if (detected.provider) {
-    const llm = await expandDishWithLlm(trimmed);
-    return {
-      title: llm.title,
-      source: "llm",
-      servings: llm.servings,
-      appetite: llm.appetite,
-      ingredients: llm.ingredients,
-      provider: llm.provider,
-      model: llm.model,
-      note:
-        llm.notes ||
-        `Generated via ${llm.provider} (${llm.model}) for ${llm.servings} ${llm.appetite} servings.`,
-    };
+  if (!detected.provider) {
+    throw new Error(
+      `${detected.detail}\n\nOr paste a recipe URL / ingredient list. Example dish: "chilli chicken for 10 medium eaters"`
+    );
   }
 
-  throw new Error(
-    `${detected.detail}\n\nOr paste a recipe URL / ingredient list. Example dish: "chilli chicken for 10 medium eaters"`
-  );
+  const llm = await expandDishWithLlm(trimmed);
+  return {
+    title: llm.title,
+    source: "llm",
+    servings: llm.servings,
+    appetite: llm.appetite,
+    ingredients: llm.ingredients,
+    provider: llm.provider,
+    model: llm.model,
+    note:
+      llm.notes ||
+      `Scaled for ${llm.servings} ${llm.appetite} eaters via ${llm.provider} (${llm.model}).`,
+  };
 }

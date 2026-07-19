@@ -24,13 +24,11 @@ Open http://localhost:3000 → **Continue with Swiggy**.
 
 ## Recipe LLM (dish names)
 
-Dish phrases like `chilli chicken for 10 medium eaters` need a local/free LLM:
+Dish phrases like `chilli chicken for 10 medium eaters` need an LLM:
 
-1. **Ollama (recommended)** — install from https://ollama.com then:
-   ```bash
-   ollama pull llama3.2
-   ```
-2. Or set `GROQ_API_KEY` / `GEMINI_API_KEY` in `.env.local` (free tiers).
+1. **NVIDIA NIM** — set `NVIDIA_API_KEY` from https://build.nvidia.com (optional `NVIDIA_NIM_MODEL`, default `meta/llama-3.1-8b-instruct`)
+2. **Ollama** — install from https://ollama.com then `ollama pull llama3.2`
+3. Or set `GROQ_API_KEY` / `GEMINI_API_KEY` in `.env.local`
 
 The UI shows **Required** (recipe qty) vs **Added** (Instamart packs) per ingredient.
 
