@@ -56,6 +56,13 @@ type AvailabilityIssue = {
   note: string;
 };
 
+type CartSubstitution = {
+  requestedName: string;
+  requestedSpinId: string;
+  addedName: string;
+  addedSpinId: string;
+};
+
 type CartLine = {
   spinId?: string;
   skuId?: string;
@@ -112,6 +119,7 @@ export default function HomePage() {
   const [availabilityIssues, setAvailabilityIssues] = useState<
     AvailabilityIssue[]
   >([]);
+  const [substitutions, setSubstitutions] = useState<CartSubstitution[]>([]);
   const [authError, setAuthError] = useState<string | null>(null);
   const [overwritePrompt, setOverwritePrompt] = useState<{
     existing: CartLine[];
@@ -178,6 +186,7 @@ export default function HomePage() {
     setCartPreview(null);
     setOverwritePrompt(null);
     setAvailabilityIssues([]);
+    setSubstitutions([]);
     setLoading(true);
     try {
       const res = await fetch("/api/match", {
@@ -228,10 +237,10 @@ export default function HomePage() {
 
   function selectedCartItems(): CartItemPayload[] {
     return matches
-      .filter((m) => m.selected && m.variant?.spinId && m.variant?.skuId)
+      .filter((m) => m.selected && m.variant?.spinId)
       .map((m) => ({
         spinId: m.variant!.spinId,
-        skuId: m.variant!.skuId!,
+        ...(m.variant!.skuId ? { skuId: m.variant!.skuId } : {}),
         quantity: m.packs || 1,
         name: m.product?.name || m.ingredient.original,
       }));
@@ -246,9 +255,11 @@ export default function HomePage() {
         return null;
       }
       const msg = String(data.error || "");
-      // Stale Instamart cart (OOS / partial) — treat as empty so fill can proceed
+      // Stale / stuck Instamart cart — treat as empty so fill can proceed
       if (
-        /out of stock|partially available|CART_EXPIRED|unavailable/i.test(msg)
+        /out of stock|partially available|CART_EXPIRED|unavailable|oops|try again after|something went wrong|Streamable HTTP|POSTing to endpoint/i.test(
+          msg
+        )
       ) {
         return { items: [] };
       }
@@ -262,13 +273,16 @@ export default function HomePage() {
     const items = selectedCartItems();
     if (!items.length) {
       setError(
-        "Select at least one matched item that has both spinId and skuId (re-run Parse & match if needed)."
+        "Select at least one matched item with a spinId (re-run Parse & match if needed)."
       );
       return;
     }
 
     setError(null);
     setOverwritePrompt(null);
+    setCartPreview(null);
+    setSubstitutions([]);
+    setAvailabilityIssues([]);
     setFilling(true);
     try {
       let cart: CartSnapshot | null = null;
@@ -281,6 +295,7 @@ export default function HomePage() {
       }
       const existing = asCartItems(cart);
       if (existing.length > 0) {
+        setCartPreview(null);
         setOverwritePrompt({ existing, pending: items });
         return;
       }
@@ -314,11 +329,23 @@ export default function HomePage() {
         }
         throw new Error(data.error || "Could not fill cart");
       }
-      // Prefer fresh get_cart payload; fall back to update response
-      const fresh = await fetchCurrentCart().catch(() => null);
-      setCartPreview((fresh || data.cart || null) as CartSnapshot | null);
+      // Prefer verified cart from fill; skip extra GET when POST already has lines
+      const fromPost =
+        data.cart && typeof data.cart === "object"
+          ? (data.cart as CartSnapshot)
+          : null;
+      const postItems = asCartItems(fromPost);
+      let preview = fromPost;
+      if (postItems.length === 0) {
+        const fresh = await fetchCurrentCart().catch(() => null);
+        if (asCartItems(fresh).length > 0) preview = fresh;
+      }
+      setCartPreview(preview);
       setAvailabilityIssues(
         Array.isArray(data.availabilityIssues) ? data.availabilityIssues : []
+      );
+      setSubstitutions(
+        Array.isArray(data.substitutions) ? data.substitutions : []
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : "Cart fill failed");
@@ -647,8 +674,12 @@ export default function HomePage() {
               {overwritePrompt.existing.length === 1 ? "" : "s"}
             </h2>
             <p className="mt-2 text-sm text-amber-900/80">
-              Overwriting replaces everything currently in your Instamart cart
-              with the {overwritePrompt.pending.length} selected recipe items.
+              Overwriting replaces your Instamart cart with the{" "}
+              {overwritePrompt.pending.length} selected item
+              {overwritePrompt.pending.length === 1 ? "" : "s"} (same address as
+              the app). Most reliable: empty the Swiggy cart first, then fill —
+              overwrites of a non-empty cart sometimes stay only on the MCP
+              side.
             </p>
             <ul className="mt-3 max-h-40 space-y-1 overflow-auto text-sm text-amber-950">
               {overwritePrompt.existing.slice(0, 12).map((item, i) => (
@@ -689,7 +720,7 @@ export default function HomePage() {
         {cartPreview != null && (
           <section className="rounded-2xl border border-[var(--leaf)]/30 bg-[var(--leaf)]/10 p-5">
             <h2 className="font-display text-xl font-semibold text-[var(--leaf)]">
-              Cart updated on Instamart
+              Cart updated (MCP)
             </h2>
             <p className="mt-2 text-sm text-[var(--muted)]">
               {previewItems.length} item
@@ -699,7 +730,9 @@ export default function HomePage() {
                 : cartPreview.billBreakdown?.toPay?.value
                   ? ` · ${cartPreview.billBreakdown.toPay.value}`
                   : ""}
-              . Open the Swiggy Instamart app and refresh the cart to checkout.
+              . Force-close and reopen the Swiggy Instamart app (or switch
+              address and back) to refresh. If the app still shows your old
+              cart, empty it there first, then fill again from here.
             </p>
             {previewItems.length > 0 ? (
               <ul className="mt-4 space-y-2">
@@ -724,6 +757,27 @@ export default function HomePage() {
                 Instamart returned an updated cart payload, but no line items
                 were parsed. Check the Swiggy app cart directly.
               </p>
+            )}
+
+            {substitutions.length > 0 && (
+              <div className="mt-4 rounded-xl border border-[var(--leaf)]/25 bg-white/60 p-3">
+                <p className="text-sm font-semibold text-[var(--ink)]">
+                  Substituted ({substitutions.length})
+                </p>
+                <ul className="mt-2 space-y-1.5 text-sm text-[var(--muted)]">
+                  {substitutions.map((s, i) => (
+                    <li key={`sub-${s.addedSpinId || i}`}>
+                      <span className="text-[var(--ink)]">{s.addedName}</span>
+                      {" replaced "}
+                      <span className="line-through">{s.requestedName}</span>
+                      <span className="block text-xs">
+                        Matched product would not stay in cart; used another
+                        in-stock pack.
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
             )}
 
             {availabilityIssues.length > 0 && (

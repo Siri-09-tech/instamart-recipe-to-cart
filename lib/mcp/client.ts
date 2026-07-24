@@ -49,10 +49,16 @@ type ToolCaller = <T>(
  * Run multiple Instamart tool calls on one MCP connection.
  * Cart mutations are more reliable when get/clear/update share a session.
  */
-export async function withInstamartSession<T>(
+function isTransportFlake(message: string): boolean {
+  return /Streamable HTTP|POSTing to endpoint|fetch failed|ECONNRESET|ETIMEDOUT|network/i.test(
+    message
+  );
+}
+
+async function openInstamartSession(
   accessToken: string,
-  fn: (call: ToolCaller) => Promise<T>
-): Promise<T> {
+  fn: (call: ToolCaller) => Promise<unknown>
+): Promise<unknown> {
   const client = new Client({ name: "recipe-to-cart", version: "0.1.0" });
   const transport = new StreamableHTTPClientTransport(new URL(IM_URL), {
     requestInit: {
@@ -97,6 +103,27 @@ export async function withInstamartSession<T>(
     } catch {
       // ignore close errors
     }
+  }
+}
+
+/**
+ * Run multiple Instamart tool calls on one MCP connection.
+ * Retries once on empty Streamable HTTP POST flakes.
+ */
+export async function withInstamartSession<T>(
+  accessToken: string,
+  fn: (call: ToolCaller) => Promise<T>
+): Promise<T> {
+  try {
+    return (await openInstamartSession(accessToken, fn)) as T;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (err instanceof McpAuthError || !isTransportFlake(message)) {
+      throw err;
+    }
+    console.log("[mcp] transport flake — retrying once:", message);
+    await new Promise((r) => setTimeout(r, 400));
+    return (await openInstamartSession(accessToken, fn)) as T;
   }
 }
 

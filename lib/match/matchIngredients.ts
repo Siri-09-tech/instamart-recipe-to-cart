@@ -15,6 +15,12 @@ import {
   classifyVariantAvailability,
   type AvailabilityInfo,
 } from "@/lib/match/availability";
+import {
+  edibleBiasedQueries,
+  hasEdibleSignal,
+  isIntentionalNonFoodSearch,
+  isNonEdibleProduct,
+} from "@/lib/match/edible";
 import { chatJson } from "@/lib/llm/provider";
 
 export type MatchedIngredient = {
@@ -160,6 +166,13 @@ function tokenize(text: string): string[] {
 }
 
 /** Prefer the user's original grocery text for Instamart search. */
+function isCookingCreamIngredient(ingredient: ParsedIngredient): boolean {
+  const text =
+    `${ingredient.original} ${ingredient.name} ${ingredient.searchQuery}`.toLowerCase();
+  if (/\bice\s*cream\b|\bicecream\b/.test(text)) return false;
+  return /\b(cream|malai|cooking\s*cream|fresh\s*cream)\b/.test(text);
+}
+
 function buildSearchQueries(ingredient: ParsedIngredient): string[] {
   const original = ingredient.original.trim();
   const name = (ingredient.name || "").trim();
@@ -174,8 +187,37 @@ function buildSearchQueries(ingredient: ParsedIngredient): string[] {
 
   const out: string[] = [];
   const seen = new Set<string>();
+  const push = (q: string) => {
+    const key = q.toLowerCase().trim();
+    if (!q || !key || seen.has(key)) return;
+    // Bare "cream" pulls medicine tubes — skip unless that's all we have later
+    if (key === "cream") return;
+    seen.add(key);
+    out.push(q.trim());
+  };
+
+  // Edible-biased queries first for ambiguous foods (rose water, chicken, cream…)
+  if (!isIntentionalNonFoodSearch(ingredient)) {
+    for (const q of edibleBiasedQueries(ingredient)) push(q);
+  }
+
+  // Cooking cream: never lead with bare "cream"
+  if (isCookingCreamIngredient(ingredient)) {
+    for (const q of [
+      "amul fresh cream",
+      "fresh cream",
+      "cooking cream",
+      searchQuery,
+      ...(ingredient.aliases || []),
+      "dairy cream",
+    ]) {
+      push(q);
+    }
+    return out.length ? out : ["amul fresh cream"];
+  }
+
   for (const q of [
-    original, // exact user text first — critical for butterscotch etc.
+    original,
     cleanedOriginal,
     name,
     searchQuery,
@@ -183,15 +225,13 @@ function buildSearchQueries(ingredient: ParsedIngredient): string[] {
   ]) {
     const key = q.toLowerCase();
     if (!q || seen.has(key)) continue;
-    // Skip ultra-generic fallbacks when we already have a specific query
     if (
       out.length > 0 &&
       (key === "ice cream" || key === "cream" || key === "fresh cream")
     ) {
       continue;
     }
-    seen.add(key);
-    out.push(q);
+    push(q);
   }
   return out;
 }
@@ -282,6 +322,29 @@ function scoreVariant(
     if (a && hay.includes(a)) score -= 40;
   }
 
+  // Strict edible-only for cooking ingredients (skip for intentional non-food grocery)
+  const enforceEdible = !isIntentionalNonFoodSearch(ingredient);
+  if (enforceEdible) {
+    if (isNonEdibleProduct(hay)) {
+      return -1000; // hard reject — never pick pet food / face toner / medicine
+    }
+    if (hasEdibleSignal(hay)) score += 12;
+  }
+
+  // Cooking cream: prefer dairy brands, hard-reject medicine tubes
+  if (isCookingCreamIngredient(ingredient)) {
+    if (
+      /\b(fresh\s*cream|cooking\s*cream|dairy|amul|mother\s*dairy|nandini|milky\s*mist|malai)\b/i.test(
+        hay
+      )
+    ) {
+      score += 55;
+    }
+    if (/\btube\b|\d+\s*%|ointment|gm\s+cream|cream\s+for\s+skin/i.test(hay)) {
+      score -= 250;
+    }
+  }
+
   if (variant.inStock === false) score -= 50;
 
   // Tiny boost for any shared non-generic token so empty-specific still ranks
@@ -300,6 +363,7 @@ function flattenRanked(
 ): RankedVariant[] {
   const ranked: RankedVariant[] = [];
   let index = 0;
+  const enforceEdible = !isIntentionalNonFoodSearch(ingredient);
 
   for (const product of products) {
     const variants = product.variants?.length
@@ -320,6 +384,14 @@ function flattenRanked(
         spinId,
         ...(skuId ? { skuId } : {}),
       };
+
+      const hay = `${productName(product)} ${variantLabel(normalized)} ${
+        product.brand || ""
+      }`;
+      if (enforceEdible && isNonEdibleProduct(hay)) {
+        continue; // drop pet food / face toner / medicine before ranking
+      }
+
       ranked.push({
         product,
         variant: normalized,
@@ -330,7 +402,7 @@ function flattenRanked(
   }
 
   ranked.sort((a, b) => b.score - a.score || a.index - b.index);
-  return ranked;
+  return ranked.filter((r) => r.score > -500);
 }
 
 function toResult(
@@ -363,7 +435,7 @@ async function pickWithLlm(
   ingredient: ParsedIngredient,
   ranked: RankedVariant[]
 ): Promise<RankedVariant | null> {
-  const top = ranked.slice(0, 12);
+  const top = ranked.filter((r) => r.score > -50).slice(0, 12);
   if (!top.length) return null;
 
   const catalog = top.map((r, i) => ({
@@ -378,14 +450,19 @@ async function pickWithLlm(
   try {
     const llm = await chatJson({
       temperature: 0,
-      system: `You pick the best Swiggy Instamart product for a grocery request.
+      system: `You pick the best Swiggy Instamart product for a grocery / cooking ingredient.
 Return ONLY JSON: {"index": <number>} from candidates.
-Match flavour, pack type (tub/cup/stick), and size closely.
-Reject wrong flavours (e.g. chocolate for butterscotch).
-If nothing is reasonable, return {"index": -1}.`,
+ONLY edible food / drink / cooking products are allowed.
+NEVER pick: pet food, dog/cat food, medicine tubes, face/skin/hair care, toners, mists for face, cleaning products.
+For "cream" pick dairy cooking cream (Amul fresh cream) — not medicine.
+For "rose water" pick edible/food-grade gulab jal — not face toner.
+For "chicken" pick fresh chicken for cooking — not pet food.
+Match flavour, pack type, and size closely.
+If nothing edible/reasonable, return {"index": -1}.`,
       user: JSON.stringify({
         request: ingredient.original,
         name: ingredient.name,
+        searchQuery: ingredient.searchQuery,
         quantity: ingredient.quantity,
         unit: ingredient.unit,
         candidates: catalog,
@@ -453,10 +530,12 @@ async function searchWithFallbackQueries(
   token: string,
   addressId: string,
   queries: string[],
+  ingredient: ParsedIngredient,
   meta?: { mode?: string; ingredient?: string }
 ): Promise<Product[]> {
   const collected: Product[] = [];
   const tried = new Set<string>();
+  const enforceEdible = !isIntentionalNonFoodSearch(ingredient);
 
   for (const q of queries) {
     const key = q.trim().toLowerCase();
@@ -465,11 +544,27 @@ async function searchWithFallbackQueries(
 
     try {
       const products = await searchProducts(token, addressId, q.trim(), 0, meta);
-      if (products.length) {
-        collected.push(...products);
-        // Original query often enough; keep one fallback if thin
-        if (collected.length >= 10) break;
+      if (!products.length) continue;
+
+      const filtered = enforceEdible
+        ? products.filter(
+            (p) =>
+              !isNonEdibleProduct(
+                `${p.displayName || p.name || ""} ${p.brand || ""}`
+              )
+          )
+        : products;
+
+      // If this query only returned non-food, try the next edible-biased query
+      if (enforceEdible && !filtered.length) {
+        console.log(
+          `[match] skipped non-edible-only results for query="${q}"`
+        );
+        continue;
       }
+
+      collected.push(...(filtered.length ? filtered : products));
+      if (collected.length >= 10) break;
     } catch {
       // try next
     }
@@ -503,6 +598,7 @@ export async function matchIngredientsToProducts(
         token,
         addressId,
         queries,
+        ingredient,
         {
           mode,
           ingredient: ingredient.original || ingredient.name,

@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { jsonError, requireAccessToken, getSession } from "@/lib/api/helpers";
-import { replaceCart, getCart, getCartSafe } from "@/lib/mcp/instamart";
+import { replaceCart, getCartSafe } from "@/lib/mcp/instamart";
 import { diffCartAvailability } from "@/lib/match/availability";
 
 const fillSchema = z.object({
@@ -39,33 +39,23 @@ export async function POST(req: Request) {
         ...(i.skuId ? { skuId: i.skuId } : {}),
         quantity: i.quantity,
         ...(i.name ? { name: i.name } : {}),
-      }))
+      })),
+      { forceClear: body.replace !== false }
     );
 
-    let cart = await getCart(token).catch(() => null);
-    if (!cart || (Array.isArray(cart.items) && cart.items.length === 0)) {
-      const fromUpdate =
-        updateResult && typeof updateResult === "object"
-          ? (updateResult as Record<string, unknown>)
-          : null;
-      if (
-        fromUpdate &&
-        Array.isArray(fromUpdate.items) &&
-        fromUpdate.items.length
-      ) {
-        cart = fromUpdate as typeof cart;
-      }
-    }
+    // Use verified cart from replaceCart — extra get_cart often flakes after long fills
+    const cart = updateResult.cart;
 
     const cartItems = Array.isArray(cart?.items)
       ? (cart!.items as Array<Record<string, unknown>>)
       : [];
 
+    // Diff against what actually landed (after substitutions), not the UI pick
     const availabilityIssues = diffCartAvailability(
-      body.items.map((i) => ({
-        spinId: i.spinId,
-        quantity: i.quantity,
-        name: i.name,
+      updateResult.accepted.map((a) => ({
+        spinId: a.spinId,
+        quantity: a.quantity,
+        name: a.name,
       })),
       cartItems
     );
@@ -74,7 +64,7 @@ export async function POST(req: Request) {
     s.addressId = addressId;
     await s.save();
 
-    const itemCount = cartItems.length || body.items.length;
+    const itemCount = cartItems.length || updateResult.accepted.length;
 
     return Response.json({
       ok: true,
@@ -82,6 +72,7 @@ export async function POST(req: Request) {
       itemCount,
       replaced: body.replace,
       availabilityIssues,
+      substitutions: updateResult.substitutions,
     });
   } catch (err) {
     return jsonError(err, "Failed to fill Instamart cart");
