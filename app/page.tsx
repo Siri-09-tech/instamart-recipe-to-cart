@@ -674,12 +674,9 @@ export default function HomePage() {
               {overwritePrompt.existing.length === 1 ? "" : "s"}
             </h2>
             <p className="mt-2 text-sm text-amber-900/80">
-              Overwriting replaces your Instamart cart with the{" "}
-              {overwritePrompt.pending.length} selected item
-              {overwritePrompt.pending.length === 1 ? "" : "s"} (same address as
-              the app). Most reliable: empty the Swiggy cart first, then fill —
-              overwrites of a non-empty cart sometimes stay only on the MCP
-              side.
+              Overwrite runs clear_cart → short pause → update_cart, then
+              confirms with get_cart. Use the same Swiggy account and delivery
+              address as in the Instamart app.
             </p>
             <ul className="mt-3 max-h-40 space-y-1 overflow-auto text-sm text-amber-950">
               {overwritePrompt.existing.slice(0, 12).map((item, i) => (
@@ -720,7 +717,7 @@ export default function HomePage() {
         {cartPreview != null && (
           <section className="rounded-2xl border border-[var(--leaf)]/30 bg-[var(--leaf)]/10 p-5">
             <h2 className="font-display text-xl font-semibold text-[var(--leaf)]">
-              Cart updated (MCP)
+              Cart confirmed via get_cart
             </h2>
             <p className="mt-2 text-sm text-[var(--muted)]">
               {previewItems.length} item
@@ -730,9 +727,9 @@ export default function HomePage() {
                 : cartPreview.billBreakdown?.toPay?.value
                   ? ` · ${cartPreview.billBreakdown.toPay.value}`
                   : ""}
-              . Force-close and reopen the Swiggy Instamart app (or switch
-              address and back) to refresh. If the app still shows your old
-              cart, empty it there first, then fill again from here.
+              . This is the MCP server cart for your logged-in Swiggy session.
+              Force-close and reopen Instamart if the app view lags; confirm the
+              same address is selected.
             </p>
             {previewItems.length > 0 ? (
               <ul className="mt-4 space-y-2">

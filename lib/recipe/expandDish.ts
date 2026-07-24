@@ -53,6 +53,8 @@ HARD RULES:
 - Scale quantities for servings and appetite (light≈0.75x, medium=1x, heavy≈1.25x vs normal adult portion).
 - original MUST state the same scaled amount as quantity+unit (e.g. original "1 tsp cumin seeds" → quantity 1, unit "tsp"). Never invent a different number.
 - If you mean one kilogram, use quantity 1 and unit "kg" — NEVER quantity 1000 with unit "kg".
+- Cooking oil for a home dish is usually tablespoons or ml (e.g. 2 tbsp), NOT litres. Never set oil to 1+ litres unless the user asked for bulk grocery oil.
+- Rice for 1–2 meals is usually cups or grams (e.g. 1–2 cups / 200–400 g), NOT multi-kg gift combos.
 - Include onions/tomato/oil/salt/cream when typical for the dish. Omit water.
 - Keep 8–18 ingredients. For ambiguous spices prefer seeds vs powder from dish context; put the wrong form in avoid[].
 - Do NOT invent Devanagari-only names. Do NOT map paneer to dahi or ghee to butter.

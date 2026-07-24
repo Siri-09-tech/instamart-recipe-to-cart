@@ -639,9 +639,9 @@ function cartSummary(cart: CartData | null | undefined): string {
 /**
  * Replace Instamart cart.
  *
- * `update_cart` **replaces** the whole cart — avoid clear_cart first.
- * clear→update was minting a new cartId each time (MCP-only ghost cart)
- * while the Swiggy app kept the previous cart. Empty carts sync; forked IDs don't.
+ * Documented overwrite pattern: clear_cart → settle (~500ms) → update_cart
+ * → get_cart. Rapid clear→update without a gap can land the update before
+ * the clear propagates. All mutations stay on one MCP connection.
  */
 export async function replaceCart(
   token: string,
@@ -650,8 +650,13 @@ export async function replaceCart(
   opts?: { forceClear?: boolean }
 ): Promise<ReplaceCartResult> {
   if (!items.length) throw new Error("No items to add to cart.");
-  // Kept for API compat; clear only as last resort inside attemptReplace
-  void opts?.forceClear;
+  const forceClear = opts?.forceClear !== false;
+  const SETTLE_MS = 500;
+
+  const tokenHint = token.length >= 8 ? `${token.slice(0, 8)}…` : "(short)";
+  console.log(
+    `[replace_cart] token=${tokenHint} addressId=${selectedAddressId} forceClear=${forceClear} items=${items.length}`
+  );
 
   const buildSubstitutions = (
     accepted: CartLineIds[]
@@ -705,7 +710,8 @@ export async function replaceCart(
     };
   };
 
-  // Resolve product candidates, then mutate cart in the same session.
+  const settle = () => new Promise((r) => setTimeout(r, SETTLE_MS));
+
   return withInstamartSession(token, async (call) => {
     const safeGet = async (): Promise<CartData> => {
       try {
@@ -719,27 +725,41 @@ export async function replaceCart(
       }
     };
 
+    // Confirm token identity via addresses (same Swiggy account as the app)
+    try {
+      const rawAddrs = await call<unknown>("get_addresses", {});
+      const addrs = asAddressList(rawAddrs);
+      const match = addrs.find((a) => a.id === selectedAddressId);
+      console.log(
+        `[replace_cart] get_addresses count=${addrs.length} selected=${selectedAddressId} found=${Boolean(match)} sample=${addrs
+          .slice(0, 3)
+          .map((a) => `${a.id}:${a.label || a.locality || "?"}`)
+          .join(" | ")}`
+      );
+      if (!match && addrs.length > 0) {
+        console.log(
+          `[replace_cart] WARNING: selected addressId not in get_addresses — possible token/session mismatch`
+        );
+      }
+    } catch (e) {
+      console.log("[replace_cart] get_addresses failed:", errMsg(e));
+    }
+
     const before = await safeGet();
     const beforeId = readCartId(before);
     const beforeSpins = cartSpinSet(before);
     const beforeAddr = cartAddressId(before);
-    // Prefer the address already bound to the live cart so we don't fork a second cart
-    const addressForWrite =
-      beforeAddr && beforeSpins.size > 0 ? beforeAddr : selectedAddressId;
+    // Always write with the UI-selected address from get_addresses
+    const addressForWrite = selectedAddressId;
     console.log(
-      `[replace_cart] before: ${cartSummary(before)} cartAddr=${beforeAddr || "none"} selected=${selectedAddressId} writeAddr=${addressForWrite}`
+      `[replace_cart] before: ${cartSummary(before)} cartAddr=${beforeAddr || "none"} writeAddr=${addressForWrite}`
     );
-    if (
-      beforeAddr &&
-      selectedAddressId &&
-      beforeAddr !== selectedAddressId
-    ) {
+    if (beforeAddr && beforeAddr !== addressForWrite) {
       console.log(
-        `[replace_cart] WARNING: overwriting cart on its bound address ${beforeAddr} (UI had ${selectedAddressId})`
+        `[replace_cart] WARNING: live cart address ${beforeAddr} ≠ write address ${addressForWrite}`
       );
     }
 
-    // Build candidates (search)
     const candidateLists: CartLineIds[][] = [];
     for (const item of items) {
       const qty = clampQty(item.quantity);
@@ -748,10 +768,10 @@ export async function replaceCart(
       if (q) {
         try {
           const raw = await call<unknown>("search_products", {
-              addressId: addressForWrite,
-              query: q,
-              offset: 0,
-            });
+            addressId: addressForWrite,
+            query: q,
+            offset: 0,
+          });
           products = asProductList(raw);
         } catch (e) {
           console.log(
@@ -774,7 +794,6 @@ export async function replaceCart(
             })
           : null;
         const spinOnly = toCartLine(item.spinId, qty, { name: item.name });
-        // Unshift in reverse preference so sku-bearing ends up first
         for (const primary of [spinOnly, withSku]) {
           if (!primary) continue;
           const key = `${primary.spinId}::${primary.skuId || ""}`;
@@ -803,14 +822,54 @@ export async function replaceCart(
     const pickPreferred = (list: CartLineIds[]) =>
       list.find((c) => c.skuId) || list[0];
 
-    /** Replace in place — clear only if old lines refuse to leave. */
-    const attemptReplace = async (
+    /** clear_cart → settle → confirm empty (retry once). */
+    const clearAndSettle = async (label: string) => {
+      console.log(`[replace_cart] clear_cart (${label})`);
+      try {
+        await call("clear_cart", {});
+      } catch (e) {
+        console.log("[replace_cart] clear_cart error:", errMsg(e));
+        throw e;
+      }
+      await settle();
+      let cart = await safeGet();
+      console.log(`[replace_cart] after clear: ${cartSummary(cart)}`);
+      const still = Array.isArray(cart.items) ? cart.items.length : 0;
+      if (still > 0) {
+        console.log(
+          `[replace_cart] clear incomplete (${still} lines) — retry clear + settle`
+        );
+        try {
+          await call("clear_cart", {});
+        } catch (e) {
+          console.log("[replace_cart] clear retry error:", errMsg(e));
+        }
+        await settle();
+        cart = await safeGet();
+        console.log(`[replace_cart] after clear retry: ${cartSummary(cart)}`);
+      }
+      return cart;
+    };
+
+    /**
+     * Overwrite: clear → settle → update_cart → settle → get_cart.
+     * skipClear=true for grow steps after an initial clear (avoids cartId thrash).
+     */
+    const overwriteFlow = async (
       lines: CartLineIds[],
       label: string,
-      allowClearFallback = true
+      opts?: { skipClear?: boolean }
     ): Promise<ReplaceCartResult> => {
+      const doClear =
+        !opts?.skipClear && (forceClear || beforeSpins.size > 0);
+      if (doClear) {
+        await clearAndSettle(label);
+      } else if (!opts?.skipClear && beforeSpins.size === 0) {
+        console.log(`[replace_cart] cart already empty — skip clear (${label})`);
+      }
+
       console.log(
-        `[replace_cart] update_cart ${label}: ${JSON.stringify(linePayload(lines))}`
+        `[replace_cart] update_cart ${label} addressId=${addressForWrite}: ${JSON.stringify(linePayload(lines))}`
       );
       await call("update_cart", {
         selectedAddressId: addressForWrite,
@@ -818,52 +877,27 @@ export async function replaceCart(
       });
       console.log(`[replace_cart] update_cart returned (${label})`);
 
-      await new Promise((r) => setTimeout(r, 500));
-      let cart = await safeGet();
-      let check = checkCart(cart, lines);
+      await settle();
+      const cart = await safeGet();
+      const check = checkCart(cart, lines);
       const afterId = readCartId(cart);
       console.log(
-        `[replace_cart] VERIFY ${label}: matched=${check.matched}/${lines.length} missing=${check.missing.length} unexpected=${check.unexpected.length} | ${cartSummary(cart)}`
+        `[replace_cart] VERIFY get_cart ${label}: matched=${check.matched}/${lines.length} missing=${check.missing.length} unexpected=${check.unexpected.length} | ${cartSummary(cart)}`
       );
       if (beforeId && afterId && beforeId !== afterId) {
         console.log(
-          `[replace_cart] cartId changed ${beforeId} → ${afterId} (fork risk)`
-        );
-      }
-
-      if (
-        allowClearFallback &&
-        !check.ok &&
-        check.unexpected.some((s) => beforeSpins.has(s))
-      ) {
-        console.log(
-          `[replace_cart] old lines persist — one clear+update (${label})`
-        );
-        try {
-          await call("clear_cart", {});
-        } catch (e) {
-          console.log("[replace_cart] clear failed:", errMsg(e));
-        }
-        await call("update_cart", {
-          selectedAddressId: addressForWrite,
-          items: linePayload(lines),
-        });
-        await new Promise((r) => setTimeout(r, 500));
-        cart = await safeGet();
-        check = checkCart(cart, lines);
-        console.log(
-          `[replace_cart] VERIFY after clear ${label}: matched=${check.matched}/${lines.length} | ${cartSummary(cart)}`
+          `[replace_cart] cartId ${beforeId} → ${afterId} (expected after clear)`
         );
       }
 
       if (!check.ok) {
         if (cartSpinSet(cart).size === 0) {
           throw new Error(
-            `Instamart accepted update but cart stayed empty (${lines.map((l) => l.spinId).join(",")}).`
+            `Instamart accepted update but get_cart stayed empty (${lines.map((l) => l.spinId).join(",")}).`
           );
         }
         throw new Error(
-          `Cart verify failed (missing: ${check.missing.join(", ") || "none"}; unexpected: ${check.unexpected.join(", ") || "none"}).`
+          `get_cart verify failed (missing: ${check.missing.join(", ") || "none"}; unexpected: ${check.unexpected.join(", ") || "none"}).`
         );
       }
 
@@ -871,29 +905,31 @@ export async function replaceCart(
       return toResult(cart, landed.length ? landed : lines);
     };
 
-    // 1) Full replace with sku-bearing candidates when possible
+    // 1) Documented overwrite with preferred candidates
     const primary = candidateLists.map(pickPreferred);
     try {
-      return await attemptReplace(primary, "primary-batch");
+      return await overwriteFlow(primary, "primary-batch");
     } catch (err) {
       console.log("[replace_cart] primary-batch failed:", errMsg(err));
     }
 
-    // 2) Single item: try alternate products (no clear)
+    // 2) Single item: clear once, then try substitutes via update only
     if (items.length === 1) {
+      await clearAndSettle("before single-item candidates");
       const list = candidateLists[0];
       let lastError: unknown;
       for (let i = 0; i < Math.min(list.length, 8); i++) {
-        if (list[i] === primary[0]) continue;
         try {
-          const result = await attemptReplace(
+          const result = await overwriteFlow(
             [list[i]],
             `candidate[${i}] ${list[i].name || list[i].spinId}`,
-            false
+            { skipClear: true }
           );
-          console.log(
-            `[replace_cart] used substitute ${list[i].name || list[i].spinId}`
-          );
+          if (list[i].spinId !== items[0].spinId) {
+            console.log(
+              `[replace_cart] used substitute ${list[i].name || list[i].spinId}`
+            );
+          }
           return result;
         } catch (err) {
           lastError = err;
@@ -905,7 +941,8 @@ export async function replaceCart(
         : new Error(errMsg(lastError) || "Could not add item to cart");
     }
 
-    // 3) Multi-item: grow by replace only (keeps cartId stable)
+    // 3) Multi-item: one clear, grow with update_cart only, then final clear→update
+    await clearAndSettle("before grow");
     const accepted: CartLineIds[] = [];
     const failures: string[] = [];
     for (let i = 0; i < candidateLists.length; i++) {
@@ -914,10 +951,10 @@ export async function replaceCart(
       for (let j = 0; j < Math.min(list.length, 5); j++) {
         const trial = [...accepted, list[j]];
         try {
-          const result = await attemptReplace(
+          const result = await overwriteFlow(
             trial,
             `grow item[${i}] cand[${j}]`,
-            false
+            { skipClear: true }
           );
           if (cartSpinSet(result.cart).has(list[j].spinId)) {
             accepted.push(list[j]);
@@ -946,13 +983,15 @@ export async function replaceCart(
       );
     }
 
-    return attemptReplace(
+    // Final documented overwrite so get_cart is the source of truth
+    return overwriteFlow(
       accepted,
       `final ${accepted.length}/${items.length}`,
-      true
+      { skipClear: false }
     );
   }).then(async (result) => {
-    await new Promise((r) => setTimeout(r, 700));
+    // Fresh connection get_cart — confirmed server state for the UI
+    await settle();
     try {
       const fresh = await getCart(token);
       const expected = new Set(result.accepted.map((a) => a.spinId));
@@ -960,19 +999,21 @@ export async function replaceCart(
       const unexpected = [...got].filter((s) => !expected.has(s));
       const missing = [...expected].filter((s) => !got.has(s));
       console.log(
-        `[replace_cart] VERIFY cross-session: ${cartSummary(fresh)} missing=${missing.length} unexpected=${unexpected.length}`
+        `[replace_cart] VERIFY cross-session get_cart: ${cartSummary(fresh)} missing=${missing.length} unexpected=${unexpected.length}`
       );
       if (unexpected.length > 0 || missing.length > 0) {
         throw new Error(
-          `Instamart cart did not sync after overwrite (missing ${missing.length}, extra ${unexpected.length}). Empty the cart in the Swiggy app for this address, then fill again from an empty cart.`
+          `get_cart after overwrite did not match (missing ${missing.length}, extra ${unexpected.length}). Check you are logged into the same Swiggy account in the app, same address (${selectedAddressId}).`
         );
       }
       if (Array.isArray(fresh.items) && fresh.items.length > 0) {
         return { ...result, cart: fresh };
       }
     } catch (err) {
-      if (/did not sync|Empty the cart/i.test(errMsg(err))) throw err;
-      console.log("[replace_cart] cross-session verify skipped:", errMsg(err));
+      if (/get_cart after overwrite|same Swiggy account/i.test(errMsg(err))) {
+        throw err;
+      }
+      console.log("[replace_cart] cross-session get_cart skipped:", errMsg(err));
     }
     return result;
   });

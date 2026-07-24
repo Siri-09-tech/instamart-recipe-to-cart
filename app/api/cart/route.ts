@@ -31,6 +31,11 @@ export async function POST(req: Request) {
       );
     }
 
+    const tokenHint = token.length >= 8 ? `${token.slice(0, 8)}…` : "(short)";
+    console.log(
+      `[api/cart] POST fill token=${tokenHint} addressId=${addressId} items=${body.items.length} replace=${body.replace !== false}`
+    );
+
     const updateResult = await replaceCart(
       token,
       addressId,

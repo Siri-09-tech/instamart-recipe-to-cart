@@ -9,7 +9,7 @@ const DISH_SIGNALS =
   /\b(biryani|pulao|pilaf|fried\s*rice|curry|masala|gravy|sambar|rasam|dal\s+tadka|dal\s+fry|korma|kofta|tikka|kebab|tandoori|butter\s+chicken|chilli\s+chicken|manchurian|noodles?|pasta|pizza|burger|sandwich|wrap|roll|dosa|idli|vada|uttapam|paratha|roti|naan|thali|soup|stew|salad|cake|cookies?|brownie|pudding|kheer|halwa|payasam|smoothie|shake|recipe|cook|make\s+me|ingredients\s+for)\b/i;
 
 const SERVING_SIGNAL =
-  /\bfor\s+\d+\b|\bserves?\s+\d+\b|\b\d+\s+(people|persons|guests|eaters|pax)\b/i;
+  /\bfor\s+\d+\b|\bserves?\s+\d+\b|\b\d+\s+(people|persons|guests|eaters|pax)\b|\bfor\s+(a\s+)?family\s+of\s+\d+\b|\bfamily\s+of\s+\d+\b|\bfor\s+\d+\s+(people|persons|guests|eaters|pax|adults|kids)\b/i;
 
 const QTY_UNIT_RE =
   /(\d+(?:\.\d+)?)\s*(gm|gms|grams?|kg|g|ml|mls|l|lt|litre|liter|cup|cups|tsp|tsps|tbsp|tbsps|pc|pcs|pieces?|bunch|bunches|clove|cloves|packet|pack|tub)\b/i;
@@ -35,7 +35,7 @@ export function classifyInputIntent(input: string): InputIntent {
     return "ingredient_list";
   }
 
-  // Explicit servings / guests → dish recipe expansion
+  // Explicit servings / guests / family size → dish recipe expansion
   if (SERVING_SIGNAL.test(trimmed)) return "dish";
 
   // Qty + product ("200gm drumsticks", "butterscotch ice cream tub 500ml")

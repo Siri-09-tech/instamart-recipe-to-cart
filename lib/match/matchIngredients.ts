@@ -6,9 +6,7 @@ import {
 } from "@/lib/mcp/instamart";
 import {
   computeQuantityInfo,
-  parsePackSize,
-  toBase,
-  normalizeUnit,
+  packFitScore,
   type QuantityInfo,
 } from "@/lib/match/quantity";
 import {
@@ -173,6 +171,15 @@ function isCookingCreamIngredient(ingredient: ParsedIngredient): boolean {
   return /\b(cream|malai|cooking\s*cream|fresh\s*cream)\b/.test(text);
 }
 
+/** Rice, oil, spices, dals — should not match meat combos / gift hampers. */
+function isPantryStapleIngredient(ingredient: ParsedIngredient): boolean {
+  const text =
+    `${ingredient.original} ${ingredient.name} ${ingredient.searchQuery}`.toLowerCase();
+  return /\b(rice|basmati|oil|ghee|atta|flour|dal|daal|lentil|spice|jeera|cumin|salt|sugar|haldi|turmeric|chilli|chili|mirch|masala|mustard|jeera\s*rice)\b/i.test(
+    text
+  );
+}
+
 function buildSearchQueries(ingredient: ParsedIngredient): string[] {
   const original = ingredient.original.trim();
   const name = (ingredient.name || "").trim();
@@ -300,20 +307,27 @@ function scoreVariant(
     if (want.packs.length && !want.packs.includes(p)) score -= 20;
   }
 
-  // Quantity closeness
-  if (ingredient.quantity != null && ingredient.unit) {
-    const pack = parsePackSize(variantLabel(variant));
-    const reqBase = toBase(
-      ingredient.quantity,
-      normalizeUnit(ingredient.unit)
-    );
-    const packBase =
-      pack.value != null ? toBase(pack.value, pack.unit) : null;
-    if (reqBase != null && packBase != null && packBase > 0) {
-      const ratio = packBase / reqBase;
-      if (ratio >= 0.7 && ratio <= 1.4) score += 20;
-      else if (ratio >= 0.4 && ratio <= 2.5) score += 8;
-      else score -= 10;
+  // Pack size vs recipe need (prefer modest overshoot; avoid 1L×3 for tbsp oil)
+  const label = variantLabel(variant);
+  score += packFitScore(ingredient.quantity, ingredient.unit, label);
+
+  // Combos / gift packs / meal kits — not ordinary pantry staples
+  if (
+    /\b(combo|combos|gift\s*pack|gift\s*hamper|hamper|bundle|assorted|meal\s*kit|thali\s*combo)\b/i.test(
+      hay
+    )
+  ) {
+    score -= 55;
+  }
+
+  // Meat / protein brands showing up for rice, oil, spices, etc.
+  if (isPantryStapleIngredient(ingredient)) {
+    if (
+      /\b(licious|freshtohome|fresh\s*to\s*home|licious\s*combo|chicken\s*combo|mutton\s*combo)\b/i.test(
+        hay
+      )
+    ) {
+      score -= 90;
     }
   }
 
@@ -401,7 +415,23 @@ function flattenRanked(
     }
   }
 
-  ranked.sort((a, b) => b.score - a.score || a.index - b.index);
+  ranked.sort((a, b) => {
+    const ds = b.score - a.score;
+    if (Math.abs(ds) > 3) return ds;
+    // Near-ties: prefer pack that fits recipe amount (avoid 1L×3 for tbsp oil)
+    const fitA = packFitScore(
+      ingredient.quantity,
+      ingredient.unit,
+      variantLabel(a.variant)
+    );
+    const fitB = packFitScore(
+      ingredient.quantity,
+      ingredient.unit,
+      variantLabel(b.variant)
+    );
+    if (fitB !== fitA) return fitB - fitA;
+    return a.index - b.index;
+  });
   return ranked.filter((r) => r.score > -500);
 }
 
@@ -454,10 +484,11 @@ async function pickWithLlm(
 Return ONLY JSON: {"index": <number>} from candidates.
 ONLY edible food / drink / cooking products are allowed.
 NEVER pick: pet food, dog/cat food, medicine tubes, face/skin/hair care, toners, mists for face, cleaning products.
+NEVER pick: gift combos, hampers, meal kits, or meat brands (Licious, FreshToHome) for rice/oil/spices.
 For "cream" pick dairy cooking cream (Amul fresh cream) — not medicine.
 For "rose water" pick edible/food-grade gulab jal — not face toner.
 For "chicken" pick fresh chicken for cooking — not pet food.
-Match flavour, pack type, and size closely.
+Match flavour and pack type. Prefer a pack size close to the recipe quantity (slightly larger is OK). Prefer a single bottle/bag over "1 L x 3" / multipack combos when the recipe only needs a little.
 If nothing edible/reasonable, return {"index": -1}.`,
       user: JSON.stringify({
         request: ingredient.original,
